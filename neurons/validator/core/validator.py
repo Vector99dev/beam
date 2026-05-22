@@ -1651,6 +1651,24 @@ class Validator:
         ]
         if eligible:
             logger.info(f"_spot_check_proofs: checking {len(eligible)} eligible orchestrators")
+
+        # Prefetch all epoch proofs in one request to avoid per-orchestrator 429 bursts
+        proof_ids_by_hotkey: Dict[str, List[str]] = {}
+        if SUBNET_CORE_AVAILABLE and self.subnet_core_client:
+            try:
+                result = await self.subnet_core_client.get_proofs_from_subnetcore(
+                    epoch=self.current_epoch,
+                    limit=1000,
+                )
+                for p in result.get("proofs", []):
+                    orch_hk = p.get("orchestrator_hotkey", "")
+                    task_id = p.get("task_id", "")
+                    if orch_hk and task_id:
+                        proof_ids_by_hotkey.setdefault(orch_hk, []).append(task_id)
+                logger.info(f"_spot_check_proofs: prefetched proofs for {len(proof_ids_by_hotkey)} orchestrators")
+            except Exception as e:
+                logger.warning(f"_spot_check_proofs: epoch proof prefetch failed: {e}")
+
         for hotkey, summary in self.work_summaries.items():
             if summary.proof_count == 0:
                 continue
@@ -1660,7 +1678,10 @@ class Validator:
                 continue
 
             try:
-                result = await self._spot_check_orchestrator(hotkey, orchestrator, summary)
+                result = await self._spot_check_orchestrator(
+                    hotkey, orchestrator, summary,
+                    prefetched_ids=proof_ids_by_hotkey.get(hotkey),
+                )
                 self.spot_check_results[hotkey] = result
                 self.spot_check_history.append(result)
 
@@ -1684,6 +1705,7 @@ class Validator:
         hotkey: str,
         orchestrator: OrchestratorInfo,
         summary: WorkSummary,
+        prefetched_ids: List[str] = None,
     ) -> SpotCheckResult:
         """Perform spot-check verification for a single orchestrator."""
         sample_percent = 0.05 + random.random() * 0.05
@@ -1693,7 +1715,7 @@ class Validator:
             f"sampling {sample_size} of {summary.proof_count} proofs ({sample_percent:.1%})"
         )
 
-        proof_ids = await self._get_random_proof_ids(orchestrator, sample_size)
+        proof_ids = await self._get_random_proof_ids(orchestrator, sample_size, prefetched_ids=prefetched_ids)
 
         if not proof_ids:
             logger.warning(f"_spot_check_orchestrator: {hotkey[:16]}... no proof IDs returned")
@@ -1773,21 +1795,29 @@ class Validator:
         self,
         orchestrator: OrchestratorInfo,
         sample_size: int,
+        prefetched_ids: List[str] = None,
     ) -> List[str]:
         """Get random proof IDs for spot-checking."""
-        # Prefer SubnetCore for proof queries
+        # Use prefetched batch if available (avoids per-orchestrator API calls)
+        if prefetched_ids is not None:
+            if not prefetched_ids:
+                return []
+            n = min(sample_size, len(prefetched_ids))
+            return random.sample(prefetched_ids, n)
+
+        # Fallback: per-orchestrator fetch
         if SUBNET_CORE_AVAILABLE and self.subnet_core_client:
             try:
                 result = await self.subnet_core_client.get_proofs_from_subnetcore(
                     epoch=self.current_epoch,
                     orchestrator_hotkey=orchestrator.hotkey,
-                    limit=sample_size * 2,  # Get extra to sample from
+                    limit=sample_size * 2,
                 )
                 proofs = result.get("proofs", [])
                 if proofs:
                     all_proof_ids = [p.get("task_id", "") for p in proofs if p.get("task_id")]
-                    sample_size = min(sample_size, len(all_proof_ids))
-                    return random.sample(all_proof_ids, sample_size) if all_proof_ids else []
+                    n = min(sample_size, len(all_proof_ids))
+                    return random.sample(all_proof_ids, n) if all_proof_ids else []
                 return []
             except Exception as e:
                 logger.warning(
@@ -1829,13 +1859,6 @@ class Validator:
         )
 
         _baseline_multiplier = 0.1
-        if self.subnet_core_client:
-            try:
-                net_config = await self.subnet_core_client.get_network_config()
-                if net_config and "validator_baseline_multiplier" in net_config:
-                    _baseline_multiplier = float(net_config["validator_baseline_multiplier"])
-            except Exception as e:
-                logger.warning(f"Could not fetch baseline multiplier from SubnetCore: {e}")
 
         for hotkey, info in self.orchestrators.items():
             summary = self.work_summaries.get(hotkey)

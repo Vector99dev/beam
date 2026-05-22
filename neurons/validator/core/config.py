@@ -135,7 +135,20 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance"""
     import os
+    from pathlib import Path
 
-    # Check for LOCAL_MODE without prefix (for consistency with orchestrator)
-    local_mode = os.getenv("LOCAL_MODE", "").lower() in ("true", "1", "yes")
+    # Load .env file so LOCAL_MODE is available via os.getenv
+    env_file = Path(".env")
+    if env_file.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_file, override=False)
+        except ImportError:
+            pass
+
+    # Accept LOCAL_MODE (no prefix) or BEAM_VALIDATOR_LOCAL_MODE
+    local_mode = (
+        os.getenv("LOCAL_MODE", "").lower() in ("true", "1", "yes")
+        or os.getenv("BEAM_VALIDATOR_LOCAL_MODE", "").lower() in ("true", "1", "yes")
+    )
     return Settings(local_mode=local_mode)

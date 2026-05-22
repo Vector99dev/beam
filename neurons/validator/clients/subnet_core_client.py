@@ -43,32 +43,6 @@ def build_signed_auth_headers(
     }
 
 
-@dataclass
-class UIDRanges:
-    subnet_orchestrator_uid: int
-    public_orchestrator_uid_start: int
-    public_orchestrator_uid_end: int
-    reserved_orchestrator_uid_start: int
-    reserved_orchestrator_uid_end: int
-    max_orchestrators: int
-
-    def is_valid_public_uid(self, uid: int) -> bool:
-        return self.public_orchestrator_uid_start <= uid <= self.public_orchestrator_uid_end
-
-    def is_valid_reserved_uid(self, uid: int) -> bool:
-        return self.reserved_orchestrator_uid_start <= uid <= self.reserved_orchestrator_uid_end
-
-    def is_subnet_orchestrator_uid(self, uid: int) -> bool:
-        return uid == self.subnet_orchestrator_uid
-
-    def is_valid_orchestrator_uid(self, uid: int) -> bool:
-        return (
-            self.is_subnet_orchestrator_uid(uid)
-            or self.is_valid_public_uid(uid)
-            or self.is_valid_reserved_uid(uid)
-        )
-
-
 class SubnetCoreClient:
     """Uses `x-api-key` for PoB; signed validator headers for heartbeat and epoch-summary."""
 
@@ -233,6 +207,23 @@ class SubnetCoreClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_proof(self, task_id: str) -> Dict[str, Any]:
+        """Get a specific proof by task ID."""
+        try:
+            response = await self._request(
+                "GET",
+                f"/pob/proof/{task_id}",
+                action="get_proof",
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error fetching proof: {e.response.status_code}")
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching proof: {e}")
+            raise
+
     async def get_latest_epoch_summary(self) -> Dict[str, Any]:
         """Latest epoch summary from BeamCore (signed validator request)."""
         response = await self._request(
@@ -242,40 +233,6 @@ class SubnetCoreClient:
         )
         response.raise_for_status()
         return response.json()
-
-    async def get_uid_ranges(self) -> Optional[UIDRanges]:
-        client = await self._get_client()
-        headers: Dict[str, str] = {}
-        if self._api_key:
-            headers["x-api-key"] = self._api_key
-        try:
-            response = await client.get(f"{self.base_url}/config/uid-ranges", headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return UIDRanges(
-                subnet_orchestrator_uid=data["subnet_orchestrator_uid"],
-                public_orchestrator_uid_start=data["public_orchestrator_uid_start"],
-                public_orchestrator_uid_end=data["public_orchestrator_uid_end"],
-                reserved_orchestrator_uid_start=data["reserved_orchestrator_uid_start"],
-                reserved_orchestrator_uid_end=data["reserved_orchestrator_uid_end"],
-                max_orchestrators=data["max_orchestrators"],
-            )
-        except Exception as exc:
-            logger.error("Error fetching UID ranges: %s", exc)
-            return None
-
-    async def get_network_config(self) -> Optional[dict]:
-        client = await self._get_client()
-        headers: Dict[str, str] = {}
-        if self._api_key:
-            headers["x-api-key"] = self._api_key
-        try:
-            response = await client.get(f"{self.base_url}/config/network", headers=headers)
-            response.raise_for_status()
-            return response.json()
-        except Exception as exc:
-            logger.warning("Error fetching network config: %s", exc)
-            return None
 
     async def submit_heartbeat(
         self,

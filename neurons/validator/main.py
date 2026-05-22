@@ -16,38 +16,6 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 
 
-def _fetch_uid_config_sync():
-    """
-    Fetch UID ranges from BeamCore synchronously before beam-dependent imports.
-    """
-    import httpx
-
-    core_url = os.getenv("BEAM_VALIDATOR_CORE_SERVER_URL", "https://beamcore.b1m.ai")
-
-    try:
-        response = httpx.get(f"{core_url}/config/uid-ranges", timeout=5.0)
-        response.raise_for_status()
-        data = response.json()
-
-        os.environ["SUBNET_ORCHESTRATOR_UID"] = str(data["subnet_orchestrator_uid"])
-        os.environ["PUBLIC_ORCHESTRATOR_UID_START"] = str(data["public_orchestrator_uid_start"])
-        os.environ["PUBLIC_ORCHESTRATOR_UID_END"] = str(data["public_orchestrator_uid_end"])
-        os.environ["RESERVED_ORCHESTRATOR_UID_START"] = str(data["reserved_orchestrator_uid_start"])
-        os.environ["RESERVED_ORCHESTRATOR_UID_END"] = str(data["reserved_orchestrator_uid_end"])
-        os.environ["MAX_ORCHESTRATORS"] = str(data["max_orchestrators"])
-
-        print(
-            f"[Startup] Fetched UID config from {core_url}: "
-            f"public={data['public_orchestrator_uid_start']}-{data['public_orchestrator_uid_end']}, "
-            f"reserved={data['reserved_orchestrator_uid_start']}-{data['reserved_orchestrator_uid_end']}"
-        )
-    except Exception as exc:
-        print(f"[Startup] Warning: Could not fetch UID config from {core_url}: {exc}")
-        print("[Startup] Using default UID ranges from environment or beam defaults")
-
-
-_fetch_uid_config_sync()
-
 from clients import close_subnet_core_client, init_subnet_core_client
 from core.config import get_settings
 from core.validator import Validator
