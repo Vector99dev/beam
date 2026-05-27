@@ -2233,7 +2233,7 @@ class Validator:
         if not uids or len(uids) != len(weights):
             logger.warning("BeamCore epoch summary missing uids/weights vectors")
             return None
-        fv = str(snapshot.get("formula_version") or "prism_final_x_task_done_count_v2")
+        fv = str(snapshot.get("formula_version") or "prism_final_x_task_done_count")
         ph = snapshot.get("params_hash")
         if isinstance(ph, str):
             params_hash: Optional[str] = ph
