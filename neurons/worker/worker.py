@@ -1144,8 +1144,6 @@ async def ws_send_task_result(
             "offer_id": offer_id or task_id,
             "worker_id": state.worker_id,
             "success": success,
-            "bytes_transferred": bytes_transferred,
-            "bandwidth_mbps": bandwidth_mbps,
             "start_time_us": start_time_us,
             "end_time_us": end_time_us,
             "latency_ms": duration_ms,
