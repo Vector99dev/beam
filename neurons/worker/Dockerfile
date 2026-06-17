@@ -1,4 +1,4 @@
-# Build from repository root (beam), not from this directory:
+# Build from the repository root, not from this directory:
 #
 #   docker build -f neurons/worker/Dockerfile -t beam-worker:latest .
 #
@@ -20,9 +20,8 @@ COPY pyproject.toml README.md /app/
 COPY beam /app/beam/
 COPY neurons /app/neurons/
 
-# Worker: worker.py documente bittensor >= 6.0.0 ; le paquet racine exige >= 7.0.0 (pyproject.toml).
-# On reste sur la série 7–9 (excl. 10+) : mêmes APIs que le worker (bt.wallet.add_args, bt.config, etc.).
-# async-substrate-interface 2.x apporte cyscale en conflit avec scalecodec ; on garde la branche 1.x.
+# Keep bittensor on the 7-9 series used by this worker entrypoint.
+# async-substrate-interface 2.x brings cyscale conflicts with scalecodec, so pin the 1.x branch.
 RUN printf "async-substrate-interface>=1.5.6,<2\n" > /tmp/pip-constraints.txt \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir . \
@@ -32,4 +31,4 @@ RUN printf "async-substrate-interface>=1.5.6,<2\n" > /tmp/pip-constraints.txt \
 WORKDIR /app/neurons/worker
 
 ENTRYPOINT ["python", "worker.py"]
-CMD ["--subtensor.network", "test"]
+CMD ["--subtensor.network", "finney"]

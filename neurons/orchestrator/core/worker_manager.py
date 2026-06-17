@@ -190,7 +190,7 @@ class WorkerManager:
                 logger.warning(f"Worker {worker_id} suspended due to verification error")
 
     async def _verify_connectivity(self, worker) -> bool:
-        """Verify worker endpoint is reachable."""
+        """Verify worker gateway is reachable."""
         try:
             url = f"http://{worker.ip}:{worker.port}/health"
             async with aiohttp.ClientSession() as session:
@@ -356,35 +356,6 @@ class WorkerManager:
         logger.info(f"Worker deregistered: {worker_id}")
         return True
 
-    async def apply_worker_stats_snapshot(
-        self,
-        worker_id: str,
-        bandwidth_mbps: float,
-        active_tasks: int,
-        bytes_relayed: int = 0,
-    ) -> bool:
-        """Apply a worker stats snapshot to the local orchestrator cache."""
-        from .orchestrator import WorkerStatus
-
-        worker = self.workers.get(worker_id)
-        if not worker:
-            return False
-
-        worker.last_seen = datetime.utcnow()
-        worker.bandwidth_mbps = bandwidth_mbps
-        worker.update_bandwidth_ema(bandwidth_mbps)
-        worker.active_tasks = active_tasks
-
-        if bytes_relayed > 0:
-            worker.bytes_relayed_total += bytes_relayed
-            worker.bytes_relayed_epoch += bytes_relayed
-
-        if worker.status == WorkerStatus.OFFLINE:
-            worker.status = WorkerStatus.ACTIVE
-            logger.info(f"Worker {worker_id} reconnected")
-
-        return True
-
     def get_worker(self, worker_id: str) -> Optional[Any]:
         """Get worker by ID."""
         return self.workers.get(worker_id)
@@ -494,90 +465,10 @@ class WorkerManager:
 
     async def sync_workers_from_subnetcore(self) -> int:
         """
-        Sync workers from SubnetCore.
-
-        Discovers affiliated workers from SubnetCore and updates the local cache.
-        Returns the number of workers synced.
-
-        SubnetCore returns anonymous worker data (no hotkey/ip/port/region for privacy):
-        - worker_id: Worker identifier
-        - status: Worker status
-        - bandwidth_mbps: Current bandwidth from the latest worker stats snapshot
-        - success_rate: Task success rate
-        - trust_score: Trust score
-        - total_tasks: Total tasks completed
-        - bytes_relayed_total: Total bytes transferred
-        - last_seen: Last telemetry or session activity time
+        Keep the local worker cache as the source of truth.
         """
-        from .orchestrator import Worker, WorkerStatus
-
-        subnet_core_client = self._get_subnet_core_client()
-        if not subnet_core_client:
-            logger.warning("Cannot sync workers: SubnetCore client not available")
-            return 0
-
-        try:
-            workers_data = await subnet_core_client.list_public_workers(status="active")
-            workers_list = workers_data.get("workers", [])
-
-            if not workers_list:
-                logger.info("No workers returned from SubnetCore")
-                return 0
-
-            synced = 0
-            for w in workers_list:
-                worker_id = w.get("worker_id", "")
-                if not worker_id:
-                    continue
-
-                # Update or create worker in local cache
-                if worker_id in self.workers:
-                    # Update existing worker with performance metrics
-                    existing = self.workers[worker_id]
-                    existing.bandwidth_mbps = w.get("bandwidth_mbps", existing.bandwidth_mbps)
-                    existing.trust_score = w.get("trust_score", existing.trust_score)
-                    existing.success_rate = w.get("success_rate", existing.success_rate)
-                    existing.total_tasks = w.get("total_tasks", existing.total_tasks)
-                    existing.bytes_relayed_total = w.get(
-                        "bytes_relayed_total", existing.bytes_relayed_total
-                    )
-                    existing.global_pending_tasks = w.get(
-                        "pending_tasks", 0
-                    )  # Global task count from BeamCore
-                    existing.last_seen = datetime.utcnow()
-                    if existing.status == WorkerStatus.OFFLINE:
-                        existing.status = WorkerStatus.ACTIVE
-                else:
-                    # Add new worker to cache (anonymous - no hotkey/ip/port/region)
-                    worker = Worker(
-                        worker_id=worker_id,
-                        hotkey="",  # Anonymous - not provided by SubnetCore
-                        ip="0.0.0.0",  # Anonymous
-                        port=0,  # Anonymous
-                        region="unknown",  # Anonymous
-                        bandwidth_mbps=w.get("bandwidth_mbps", 0.0),
-                        status=WorkerStatus.ACTIVE,
-                        trust_score=w.get("trust_score", 0.5),
-                        success_rate=w.get("success_rate", 1.0),
-                        total_tasks=w.get("total_tasks", 0),
-                        bytes_relayed_total=w.get("bytes_relayed_total", 0),
-                        global_pending_tasks=w.get(
-                            "pending_tasks", 0
-                        ),  # Global task count from BeamCore
-                    )
-                    self.workers[worker_id] = worker
-                    # No hotkey/region indexing since anonymous
-
-                synced += 1
-
-            logger.info(
-                f"Synced {synced} workers from SubnetCore (total in cache: {len(self.workers)})"
-            )
-            return synced
-
-        except Exception as e:
-            logger.error("Failed to sync workers from SubnetCore: %r", e)
-            return 0
+        logger.debug("Worker cache sync uses local worker registrations only")
+        return 0
 
     async def worker_sync_loop(self, running_flag, interval_seconds: int = 60) -> None:
         """Background loop for syncing workers from SubnetCore."""

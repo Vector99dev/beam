@@ -56,9 +56,9 @@ import bittensor as bt
 
 from .config import OrchestratorSettings, get_settings
 from .epoch_manager import EpochManager
-from .proof_aggregator import ProofAggregator
 from .reward_manager import RewardManager
 from .task_scheduler import TaskScheduler
+from .worker_gateway import WorkerGateway
 from .worker_manager import WorkerManager
 
 # BlindWorkerManager removed
@@ -271,42 +271,6 @@ class PendingOffer:
 
 
 @dataclass
-class BandwidthProof:
-    """Proof of bandwidth work completed by a worker."""
-
-    task_id: str
-    worker_id: str
-    worker_hotkey: str
-
-    # Timing (microseconds)
-    start_time_us: int
-    end_time_us: int
-
-    # Metrics
-    bytes_relayed: int
-    bandwidth_mbps: float
-
-    # Verification
-    chunk_hash: str
-    canary_proof: str
-
-    # Signatures
-    worker_signature: str = ""
-    orchestrator_signature: str = ""
-    worker_coldkey: str = ""
-
-    # Metadata
-    source_region: str = ""
-    dest_region: str = ""
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-
-    @property
-    def duration_ms(self) -> float:
-        """Task duration in milliseconds."""
-        return (self.end_time_us - self.start_time_us) / 1000
-
-
-@dataclass
 class EpochSummary:
     """Aggregated work summary for a validation epoch."""
 
@@ -363,7 +327,6 @@ class Orchestrator:
         self._task_sched = TaskScheduler(
             self.settings, self._worker_mgr, get_subnet_core_client=lambda: self.subnet_core_client
         )
-        self._proof_agg = ProofAggregator(self.settings)
         self._reward_mgr = RewardManager(self.settings)
         self._epoch_mgr = EpochManager(self.settings)
         # BlindWorkerManager removed
@@ -382,10 +345,6 @@ class Orchestrator:
         self.pending_offers = self._task_sched.pending_offers
         self._offer_lock = self._task_sched._offer_lock
 
-        # Proof state (from ProofAggregator)
-        self.pending_proofs = self._proof_agg.pending_proofs
-        self.epoch_proofs = self._proof_agg.epoch_proofs
-
         # Epoch tracking
         self.current_epoch: int = 0
         self.epoch_start_time: datetime = datetime.utcnow()
@@ -402,6 +361,11 @@ class Orchestrator:
 
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
+
+        # In-process worker gateway (workers dial /ws/{worker_id})
+        self.worker_gateway: WorkerGateway = WorkerGateway(
+            on_ready_change=self._on_worker_gateway_ready_change,
+        )
 
         # Async control
         self._running: bool = False
@@ -435,6 +399,18 @@ class Orchestrator:
     def total_rewards_distributed(self, value: float):
         self._reward_mgr.total_rewards_distributed = value
 
+    def _on_worker_gateway_ready_change(self, ready: bool) -> None:
+        """Toggle orchestrator readiness when the first/last worker connects."""
+        if self.subnet_core_client is None:
+            return
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.subnet_core_client.set_ready(ready))
+        except Exception as exc:
+            logger.warning("ready-change signal failed: %s", exc)
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -463,10 +439,17 @@ class Orchestrator:
             self.hotkey = self.wallet.hotkey.ss58_address
             logger.info(f"Orchestrator wallet: {self.hotkey}")
 
-            self._initialize_subtensor_and_metagraph_with_retry()
+            if self.settings.uid is not None:
+                # UID pre-configured via ORCHESTRATOR_UID — skip slow subtensor init
+                self.our_uid = self.settings.uid
+                self.subtensor = None
+                self.metagraph = None
+                logger.info("Using configured orchestrator UID %s — skipping subtensor init", self.our_uid)
+            else:
+                self._initialize_subtensor_and_metagraph_with_retry()
 
-            # Find our UID in the metagraph
-            self._find_our_uid()
+                # Find our UID in the metagraph
+                self._find_our_uid()
 
         # Initialize SubnetCoreClient for API-based data operations
         await self._init_subnet_core_client()
@@ -548,15 +531,7 @@ class Orchestrator:
             asyncio.create_task(self._metagraph_sync_loop()),
             asyncio.create_task(self._worker_mgr.worker_health_loop(running)),
             asyncio.create_task(self._worker_mgr.worker_sync_loop(running, interval_seconds=60)),
-            asyncio.create_task(
-                self._proof_agg.proof_aggregation_loop(
-                    running,
-                    subnet_core_client_ref=lambda: self.subnet_core_client,
-                )
-            ),
-            # Removed: validator_report_loop - BeamCore handles PoB centrally, validators read from BeamCore
             asyncio.create_task(self._epoch_management_loop()),
-            # Removed: _stale_task_reassignment_loop - deprecated endpoint replaced by WebSocket push
         ]
         logger.info("Worker sync loop started (syncs from SubnetCore every 60s)")
 
@@ -598,13 +573,6 @@ class Orchestrator:
 
     async def deregister_worker(self, worker_id):
         return await self._worker_mgr.deregister_worker(worker_id)
-
-    async def apply_worker_stats_snapshot(
-        self, worker_id, bandwidth_mbps, active_tasks, bytes_relayed=0
-    ):
-        return await self._worker_mgr.apply_worker_stats_snapshot(
-            worker_id, bandwidth_mbps, active_tasks, bytes_relayed
-        )
 
     def get_worker(self, worker_id):
         return self._worker_mgr.get_worker(worker_id)
@@ -750,226 +718,6 @@ class Orchestrator:
 
     async def _notify_offer_result(self, offer_id, winner_id, status):
         return await self._task_sched._notify_offer_result(offer_id, winner_id, status)
-
-    # =========================================================================
-    # Cross-cutting: Task Completion & Relay Results
-    # =========================================================================
-
-    async def complete_task(
-        self,
-        task_id: str,
-        bytes_relayed: int,
-        bandwidth_mbps: float,
-        start_time_us: int,
-        end_time_us: int,
-        canary_proof: str,
-        worker_signature: str,
-    ) -> Optional[BandwidthProof]:
-        """Record task completion and generate proof."""
-        logger.info(f"complete_task called: task_id={task_id[:20]}..., bytes={bytes_relayed}")
-        task = self.active_tasks.get(task_id)
-        if not task:
-            logger.warning(f"Unknown task: {task_id[:16]}...")
-            return None
-
-        worker = self.workers.get(task.worker_id)
-        worker_hotkey = None
-        worker_region = ""
-        logger.info(
-            f"complete_task: worker_id={task.worker_id}, in_memory={worker is not None}, client={self.subnet_core_client is not None}"
-        )
-        if worker:
-            worker_hotkey = worker.hotkey
-            worker_region = getattr(worker, "region", "") or task.source_region or ""
-            logger.info(f"complete_task: using in-memory worker hotkey={worker_hotkey[:16]}...")
-        elif self.subnet_core_client:
-            # Fall back to database lookup
-            try:
-                logger.info(f"complete_task: looking up worker {task.worker_id} from SubnetCore...")
-                worker_data = await self.subnet_core_client.get_worker(task.worker_id)
-                worker_hotkey = worker_data.get("hotkey", "")
-                worker_region = worker_data.get("region", "") or task.source_region or ""
-                logger.info(
-                    f"complete_task: got worker_hotkey={worker_hotkey[:16] if worker_hotkey else 'None'}..."
-                )
-            except Exception as e:
-                logger.warning(f"Worker lookup failed for task {task_id[:16]}...: {e}")
-
-        if not worker_hotkey:
-            logger.warning(f"Worker not found for task: {task_id[:16]}... (no hotkey)")
-            return None
-
-        # Update task
-        task.status = "completed"
-        task.completed_at = time.time()
-        task.bytes_relayed = bytes_relayed
-        task.bandwidth_mbps = bandwidth_mbps
-        task.latency_ms = (end_time_us - start_time_us) / 1000
-
-        # Update worker stats (only if worker is in memory)
-        if worker:
-            worker.active_tasks = max(0, worker.active_tasks - 1)
-            worker.successful_tasks += 1
-            worker.bytes_relayed_total += bytes_relayed
-            worker.bytes_relayed_epoch += bytes_relayed
-            worker.update_bandwidth_ema(bandwidth_mbps)
-            worker.update_success_rate()
-            worker.trust_score = min(1.0, worker.trust_score + 0.001)
-
-        # Move to completed
-        del self.active_tasks[task_id]
-        self.completed_tasks[task_id] = task
-
-        # Update global stats
-        self.total_bytes_relayed += bytes_relayed
-        self.total_tasks_completed += 1
-
-        # Generate proof
-        proof = BandwidthProof(
-            task_id=task_id,
-            worker_id=task.worker_id,
-            worker_hotkey=worker_hotkey,
-            start_time_us=start_time_us,
-            end_time_us=end_time_us,
-            bytes_relayed=bytes_relayed,
-            bandwidth_mbps=bandwidth_mbps,
-            chunk_hash=task.chunk_hash,
-            canary_proof=canary_proof,
-            worker_signature=worker_signature,
-            source_region=task.source_region or worker_region,
-            dest_region=task.dest_region or worker_region,
-        )
-
-        proof.orchestrator_signature = self._sign_proof(proof)
-
-        # BeamCore manages task lifecycle server-side: tasks are queued
-        # from WS chunk_assignments and completion is reflected from worker
-        # task_result_summary pushes (see task-lifecycle.ts). No HTTP write needed.
-
-        # Add to aggregation queue
-        self.pending_proofs.append(proof)
-        self.epoch_proofs[self.current_epoch].append(proof)
-
-        # Persist proof
-        await self._proof_agg.persist_bandwidth_proof(
-            proof, self.current_epoch, self.subnet_core_client
-        )
-
-        # NOTE: Worker ALPHA payments are intentionally NOT triggered here.
-        # This orchestrator no longer pays workers; it only records emission
-        # share / bandwidth stats and publishes PoB. See plan
-        # `remove_orch_payment_machinery_30534c30`.
-
-        logger.info(
-            f"Task {task_id[:16]}... completed: "
-            f"{bytes_relayed} bytes @ {bandwidth_mbps:.2f} Mbps"
-        )
-        return proof
-
-    async def record_relay_result(
-        self,
-        worker_id: str,
-        task_id: str,
-        success: bool,
-        bytes_relayed: int,
-        bandwidth_mbps: float,
-        chunks_relayed: int,
-        latency_ms: float,
-        proof_of_bandwidth: dict,
-    ) -> Optional[BandwidthProof]:
-        """Record a relay result from a worker (P2P transfer)."""
-        worker = self.workers.get(worker_id)
-        worker_hotkey = None
-        worker_region = ""
-        if worker:
-            worker_hotkey = worker.hotkey
-            worker_region = getattr(worker, "region", "")
-        elif self.subnet_core_client:
-            try:
-                worker_data = await self.subnet_core_client.get_worker(worker_id)
-                worker_hotkey = worker_data.get("hotkey", "")
-                worker_region = worker_data.get("region", "")
-            except Exception as e:
-                logger.warning(f"Worker lookup failed for relay result {worker_id}: {e}")
-
-        if not worker_hotkey:
-            logger.warning(f"Unknown worker {worker_id} sent relay result (no hotkey)")
-            return None
-
-        if not success:
-            if worker:
-                worker.failed_tasks += 1
-                worker.update_success_rate()
-            return None
-
-        # Update worker stats (only if worker is in memory)
-        if worker:
-            worker.successful_tasks += 1
-            worker.bytes_relayed_total += bytes_relayed
-            worker.bytes_relayed_epoch += bytes_relayed
-            if bandwidth_mbps > 0:
-                worker.update_bandwidth_ema(bandwidth_mbps)
-            worker.update_success_rate()
-            worker.trust_score = min(1.0, worker.trust_score + 0.001)
-
-        # Update global stats
-        self.total_bytes_relayed += bytes_relayed
-        self.total_tasks_completed += 1
-
-        # Generate proof with realistic timestamps
-        current_time_us = int(time.time() * 1_000_000)
-        if latency_ms > 0:
-            estimated_duration_us = int(latency_ms * 1000)
-        elif bandwidth_mbps > 0 and bytes_relayed > 0:
-            estimated_duration_us = int(
-                (bytes_relayed * 8) / (bandwidth_mbps * 1_000_000) * 1_000_000
-            )
-        else:
-            estimated_duration_us = 100_000
-        estimated_duration_us = max(estimated_duration_us, 10_000)
-
-        start_time_us = proof_of_bandwidth.get(
-            "start_time_us", current_time_us - estimated_duration_us
-        )
-        end_time_us = proof_of_bandwidth.get("end_time_us", current_time_us)
-
-        proof = BandwidthProof(
-            task_id=task_id or f"relay-{worker_id}-{int(time.time())}",
-            worker_id=worker_id,
-            worker_hotkey=worker_hotkey,
-            start_time_us=start_time_us,
-            end_time_us=end_time_us,
-            bytes_relayed=bytes_relayed,
-            bandwidth_mbps=bandwidth_mbps,
-            chunk_hash=proof_of_bandwidth.get("transfer_id", ""),
-            canary_proof="",
-            worker_signature=proof_of_bandwidth.get("signature", ""),
-            source_region=worker_region,
-            dest_region="local",
-        )
-
-        if hasattr(self, "_sign_proof"):
-            proof.orchestrator_signature = self._sign_proof(proof)
-
-        # BeamCore manages task lifecycle server-side: tasks are queued
-        # from WS chunk_assignments and completion is reflected from worker
-        # task_result_summary pushes (see task-lifecycle.ts). No HTTP write needed.
-
-        self.pending_proofs.append(proof)
-        self.epoch_proofs[self.current_epoch].append(proof)
-
-        await self._proof_agg.persist_bandwidth_proof(
-            proof, self.current_epoch, self.subnet_core_client
-        )
-
-        # NOTE: Worker ALPHA payments are intentionally NOT triggered here.
-        # See `complete_task` for the same rationale.
-
-        logger.info(
-            f"Recorded relay result from worker {worker_id}: "
-            f"{bytes_relayed} bytes at {bandwidth_mbps:.1f} Mbps"
-        )
-        return proof
 
     async def fail_task(self, task_id: str, reason: str) -> None:
         """Record task failure."""
@@ -1193,14 +941,35 @@ class Orchestrator:
             f"(previous epoch {prev_epoch}: {tasks} tasks, {bytes_relayed} bytes)"
         )
 
-    # Stale-task reassignment is owned by BeamCore server-side.
+    # BeamCore owns stalled chunk recovery server-side.
 
     # =========================================================================
     # State & Metrics
     # =========================================================================
 
     def _build_epoch_summary(self) -> EpochSummary:
-        return self._proof_agg.build_epoch_summary(self.current_epoch, self.epoch_start_time)
+        workers = list(self.workers.values())
+        active_workers = [worker for worker in workers if worker.bytes_relayed_epoch > 0]
+        total_bytes = sum(worker.bytes_relayed_epoch for worker in workers)
+        total_tasks = sum(worker.successful_tasks for worker in workers)
+        failed_tasks = sum(worker.failed_tasks for worker in workers)
+        total_completed = total_tasks + failed_tasks
+
+        return EpochSummary(
+            epoch=self.current_epoch,
+            start_time=self.epoch_start_time,
+            end_time=datetime.utcnow(),
+            total_tasks=total_completed,
+            successful_tasks=total_tasks,
+            failed_tasks=failed_tasks,
+            total_bytes_relayed=total_bytes,
+            active_workers=len(active_workers),
+            worker_contributions={
+                worker.worker_id: worker.bytes_relayed_epoch
+                for worker in active_workers
+            },
+            success_rate=(total_tasks / total_completed) if total_completed else 0.0,
+        )
 
     def get_state(self) -> dict:
         """Get current Orchestrator state."""
@@ -1222,10 +991,8 @@ class Orchestrator:
                 for status in WorkerStatus
             },
             "active_tasks": len(self.active_tasks),
-            "pending_proofs": len(self.pending_proofs),
             "total_bytes_relayed": self.total_bytes_relayed,
             "total_tasks_completed": self.total_tasks_completed,
-            # validators_known removed - BeamCore handles PoB centrally
         }
 
     def get_worker_stats(self) -> List[dict]:
@@ -1280,22 +1047,6 @@ class Orchestrator:
         data = f"{hotkey}:{ip}:{port}:{time.time()}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
-    def _sign_proof(self, proof: BandwidthProof) -> str:
-        """Sign a proof with orchestrator key."""
-        message = f"{proof.task_id}:{proof.worker_id}:{proof.bytes_relayed}"
-
-        if self.wallet is None:
-            import hashlib
-
-            return hashlib.sha256(message.encode()).hexdigest()
-
-        signature = self.wallet.hotkey.sign(message.encode())
-        return signature.hex() if isinstance(signature, bytes) else str(signature)
-
-    # =========================================================================
-    # Initialization Helpers
-    # =========================================================================
-
     async def _init_subnet_core_client(self) -> None:
         """Initialize SubnetCoreClient for API-based data operations."""
         if not SUBNET_CORE_CLIENT_AVAILABLE:
@@ -1331,13 +1082,11 @@ class Orchestrator:
                 self.settings.orch_gateway_url,
             )
 
-            # WS push handlers. Transfer assignments are owned by the client
-            # itself (`_handle_transfer_assigned` -> WS chunk_assignments) per
-            # the BeamCore contract.
-            self.subnet_core_client.set_task_completion_handler(
-                self._handle_task_completion_notification
-            )
+            # WS push handlers. BeamCore task offer batches drive worker routing.
             self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
+
+            # Wire the in-process worker gateway.
+            self.subnet_core_client.set_worker_gateway(self.worker_gateway)
 
             # Configure registration message sent on every WS connect
             import socket as _socket
@@ -1350,17 +1099,26 @@ class Orchestrator:
             except Exception:
                 local_ip = self.settings.external_ip or "127.0.0.1"
             orch_url = f"http://{local_ip}:{self.settings.api_port}"
+            # gateway_url: explicit orchestrator-owned worker gateway override takes priority;
+            # otherwise derive from the orchestrator's own HTTP address.
+            gateway_url = (
+                self.settings.worker_gateway_url
+                or f"http://{local_ip}:{self.settings.api_port}"
+            )
             self.subnet_core_client.set_registration_config(
                 url=orch_url,
                 region=self.settings.region,
                 max_workers=self.settings.max_workers,
                 uid=self.our_uid,
                 fee_percentage=self.settings.fee_percentage,
-                gateway_url=self.settings.worker_gateway_public_url,
+                gateway_url=gateway_url,
             )
             self.subnet_core_client.prime_ready_state(bool(self.settings.ready))
             logger.info(
-                f"WS registration config set: url={orch_url}, region={self.settings.region}"
+                "WS registration config set: url=%s region=%s gateway_url=%s",
+                orch_url,
+                self.settings.region,
+                gateway_url,
             )
 
             # Start WebSocket connection for real-time notifications and
@@ -1372,83 +1130,8 @@ class Orchestrator:
             logger.warning(f"Failed to initialize SubnetCoreClient: {e}")
             self.subnet_core_client = None
 
-    async def _handle_task_completion_notification(self, message: dict) -> bool:
-        """
-        Handle task completion notifications from SubnetCore.
-
-        Verifies the completion (worker match + bytes sanity) and updates
-        local task / per-worker stats. Returning True triggers the
-        ``acknowledge_task_completions`` ack in
-        ``SubnetCoreClient._handle_ws_message`` (BeamCore task lifecycle).
-
-        Worker payment management is operator-defined.
-        This handler updates local task and worker accounting.
-
-        Args:
-            message: Task completion message with task_id, worker_id, bytes, etc.
-
-        Returns:
-            True if verified and should be acknowledged, False otherwise
-        """
-        task_id = message.get("task_id")
-        worker_id = message.get("worker_id")
-        bytes_transferred = message.get("bytes_relayed", 0) or message.get("bytes_transferred", 0)
-        bandwidth_mbps = message.get("bandwidth_mbps", 0.0)
-
-        logger.info(
-            f"Verifying task completion: task={task_id[:16] if task_id else 'none'}... "
-            f"worker={worker_id[:16] if worker_id else 'none'}... bytes={bytes_transferred}"
-        )
-
-        task = self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
-
-        # Get reassigned_worker_id (set by BeamCore when task was reassigned)
-        # worker_id = original assignee, reassigned_worker_id = new worker after reassignment
-        reassigned_worker_id = message.get("reassigned_worker_id")
-
-        if task:
-            worker_matches = task.worker_id == worker_id or (
-                reassigned_worker_id and reassigned_worker_id == worker_id
-            )
-            if not worker_matches:
-                logger.warning(
-                    f"Worker mismatch for task {task_id}: expected {task.worker_id} "
-                    f"or reassigned={reassigned_worker_id}, got {worker_id}"
-                )
-                return False
-
-            if task.chunk_size:
-                expected_bytes = task.chunk_size
-                tolerance = expected_bytes * 0.2
-                if abs(bytes_transferred - expected_bytes) > tolerance:
-                    logger.warning(
-                        f"Bytes mismatch for task {task_id}: expected ~{expected_bytes}, "
-                        f"got {bytes_transferred}"
-                    )
-
-            if task_id in self.active_tasks:
-                task.status = "completed"
-                task.completed_at = time.time()
-                task.bytes_relayed = bytes_transferred
-                task.bandwidth_mbps = bandwidth_mbps
-                del self.active_tasks[task_id]
-                self.completed_tasks[task_id] = task
-                self.total_bytes_relayed += bytes_transferred
-                self.total_tasks_completed += 1
-                logger.info(f"Task {task_id[:16]}... marked completed via SubnetCore notification")
-        else:
-            logger.info(
-                f"Task {task_id[:16]}... not in memory, recording stats from SubnetCore data"
-            )
-            self.total_bytes_relayed += bytes_transferred
-            self.total_tasks_completed += 1
-
-        return True
-
-    # Transfer notification + chunk assignment is handled inside
-    # SubnetCoreClient._handle_transfer_assigned (BeamCore WS push):
-    # the client receives transfer_assigned, requests workers via WS
-    # list_workers, and submits WS chunk_assignments. No HTTP path needed.
+    # SubnetCoreClient receives BeamCore task offer batches and routes them
+    # to connected local workers.
 
     async def _init_orch_manager(self) -> None:
         """Initialize the orchestrator manager for incentive mechanism."""

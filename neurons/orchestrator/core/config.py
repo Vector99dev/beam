@@ -92,13 +92,6 @@ class OrchestratorSettings(BaseSettings):
     chunk_size_bytes: int = Field(default=1024 * 1024, env="CHUNK_SIZE")  # 1 MB
 
     # ==========================================================================
-    # Proof Aggregation
-    # ==========================================================================
-    proof_batch_size: int = Field(default=100, env="PROOF_BATCH_SIZE")
-    proof_aggregation_interval: int = Field(default=60, env="PROOF_AGGREGATION_INTERVAL")
-    min_proofs_for_epoch: int = Field(default=10, env="MIN_PROOFS_FOR_EPOCH")
-
-    # ==========================================================================
     # Anti-Fraud Settings
     # ==========================================================================
     enable_geo_verification: bool = Field(default=True, env="ENABLE_GEO_VERIFICATION")
@@ -106,19 +99,19 @@ class OrchestratorSettings(BaseSettings):
     max_suspicious_score: float = Field(default=0.3, env="MAX_SUSPICIOUS_SCORE")
 
     # ==========================================================================
-    # BeamCore API (for internal data storage)
+    # BeamCore API
     # ==========================================================================
     core_server_url: str = Field(default="https://beamcore.b1m.ai", env="CORE_SERVER_URL")
 
     orch_gateway_url: Optional[str] = Field(default=None, env="ORCH_GATEWAY_URL")
 
-    # Orch-gateway WebSocket transport (high-latency / WSL / cross-region: increase these)
+    # Orch-gateway WebSocket transport (high-latency / cross-region: increase these)
     orch_ws_open_timeout: float = Field(default=60.0, env="ORCH_WS_OPEN_TIMEOUT")
     orch_ws_close_timeout: float = Field(default=20.0, env="ORCH_WS_CLOSE_TIMEOUT")
     orch_ws_ping_interval: float = Field(default=30.0, env="ORCH_WS_PING_INTERVAL")
     orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
 
-    worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
+    worker_gateway_url: Optional[str] = Field(default=None, env="ORCHESTRATOR_WORKER_GATEWAY_URL")
 
     # ==========================================================================
     # Worker Scoring Weights (for selection)

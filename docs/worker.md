@@ -7,7 +7,7 @@ Run a worker on BEAM mainnet.
 | Service | Environment variable | URL |
 | ------- | -------------------- | --- |
 | Core server | `CORE_SERVER_URL` | `https://beamcore.b1m.ai` |
-| Worker gateway | `WORKER_GATEWAY_URL` | `https://public-worker-gateway.b1m.ai` |
+| Worker gateway | `WORKER_GATEWAY_URL` | Operator/orchestrator-owned worker gateway |
 
 ## Requirements
 
@@ -40,7 +40,7 @@ Create or export the worker environment before starting the process:
 
 ```bash
 CORE_SERVER_URL=https://beamcore.b1m.ai
-WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
+WORKER_GATEWAY_URL=https://your-orchestrator-worker-gateway.example
 SUBTENSOR_NETWORK=finney
 NETUID=105
 ```
@@ -57,6 +57,6 @@ python worker.py --wallet.name your_coldkey --wallet.hotkey your_hotkey --subten
 ## Troubleshooting
 
 - Verify the hotkey is registered on subnet 105.
-- Verify `WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai`.
+- Verify `WORKER_GATEWAY_URL` points to the orchestrator-owned worker gateway.
 - Verify `CORE_SERVER_URL=https://beamcore.b1m.ai`.
 - If the worker starts but receives no tasks, keep it connected and confirm the gateway URL is reachable from the host.

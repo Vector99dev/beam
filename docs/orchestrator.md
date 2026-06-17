@@ -1,21 +1,41 @@
-# BEAM Orchestrator Guide
+# BEAM Orchestrator Onboarding Guide
 
-Run an orchestrator on BEAM mainnet.
+This guide covers the public mainnet orchestrator path for Beam subnet 105. An orchestrator keeps a WebSocket session to the orchestrator gateway, advertises a worker gateway, selects connected workers for task offers, and forwards worker decisions/results back to BeamCore.
 
-## Public Endpoints
+## Runtime Responsibilities
 
-| Service | Environment variable | URL |
-| ------- | -------------------- | --- |
-| Core server | `CORE_SERVER_URL` | `https://beamcore.b1m.ai` |
-| Orchestrator gateway | `ORCH_GATEWAY_URL` | `https://orch-gateway.b1m.ai` |
+The orchestrator process:
 
-Workers use `WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai`.
+1. Registers on the Beam orchestrator gateway using wallet-signed WebSocket messages.
+2. Advertises its HTTP URL and worker gateway URL.
+3. Maintains an in-process worker gateway at `/ws/<worker_id>?api_key=...` unless `ORCHESTRATOR_WORKER_GATEWAY_URL` points at an externally reachable gateway origin.
+4. Receives `worker_task_offer_batch` messages from BeamCore through `ORCH_GATEWAY_URL`.
+5. Selects connected local workers and sends `task_offer` messages.
+6. Relays `task_accept`, `task_reject`, and `task_result` messages upstream.
+7. Stays `READY=true` when it should receive routed production work.
+
+Workers use BeamCore HTTP for registration and payment evidence, but runtime task delivery uses the worker gateway.
+
+## Mainnet Endpoints
+
+| Setting | Value |
+|---|---|
+| `CORE_SERVER_URL` | `https://beamcore.b1m.ai` |
+| `ORCH_GATEWAY_URL` | `https://orch-gateway.b1m.ai` |
+| `ORCHESTRATOR_WORKER_GATEWAY_URL` | Your externally reachable worker gateway origin |
+| `SUBTENSOR_NETWORK` | `finney` |
+| `NETUID` | `105` |
+
+`ORCHESTRATOR_WORKER_GATEWAY_URL` and worker `WORKER_GATEWAY_URL` should refer to the same worker gateway origin when workers connect through a public domain or reverse proxy.
 
 ## Requirements
 
-- Python 3.10-3.12
-- A Bittensor wallet with a registered hotkey on subnet 105
-- Stable public network connectivity
+| Component | Requirement |
+|---|---|
+| Python | 3.10-3.12 |
+| Wallet | Registered miner hotkey on subnet 105 |
+| Network | Stable outbound access to BeamCore, orch-gateway, Bittensor, and storage backends |
+| Port | Default orchestrator HTTP/worker-gateway port `8000` unless `API_PORT` is changed |
 
 ## Install
 
@@ -27,52 +47,159 @@ source .venv/bin/activate
 pip install -e "."
 ```
 
-## Register
+## Register On Subnet 105
 
 ```bash
 btcli subnet register --netuid 105 --subtensor.network finney \
-  --wallet.name your_coldkey \
-  --wallet.hotkey your_hotkey
+  --wallet.name orchestrator --wallet.hotkey default
+```
+
+Confirm the hotkey is registered:
+
+```bash
+btcli wallet overview --wallet.name orchestrator --subtensor.network finney
 ```
 
 ## Configure
 
-Create `neurons/orchestrator/.env`:
+Create `neurons/orchestrator/.env` or set these variables in your process manager:
 
-```bash
+```dotenv
+WALLET_NAME=orchestrator
+WALLET_HOTKEY=default
 CORE_SERVER_URL=https://beamcore.b1m.ai
 ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai
+ORCHESTRATOR_WORKER_GATEWAY_URL=https://orchestrator.example.com
 SUBTENSOR_NETWORK=finney
 NETUID=105
+READY=true
 
-WALLET_NAME=your_coldkey
-WALLET_HOTKEY=your_hotkey
-WALLET_PATH=~/.bittensor/wallets
-
-READY=false
+# Optional
+API_PORT=8000
 LOG_LEVEL=INFO
+REGION=global
+FEE_PERCENTAGE=0
+MAX_WORKERS=10000
 ```
 
-Set `READY=true` only when the orchestrator is ready to accept transfer work.
+Important settings:
+
+| Variable | Purpose |
+|---|---|
+| `CORE_SERVER_URL` | BeamCore HTTP base used for registration/auth bootstrap |
+| `ORCH_GATEWAY_URL` | Orchestrator gateway origin used for the persistent control-plane WebSocket |
+| `ORCHESTRATOR_WORKER_GATEWAY_URL` | Public worker gateway origin advertised to BeamCore |
+| `READY` | `true` opts the orchestrator into routed work; default is `false` |
+| `API_PORT` | FastAPI port and in-process worker-gateway port |
+
+The participant orchestrator does not require the legacy Redis or local auth toggles for the documented production hot path.
 
 ## Run
 
 ```bash
 cd neurons/orchestrator
+source ../../.venv/bin/activate
 python main.py
 ```
 
-Useful health checks:
+## Health And Readiness
 
 ```bash
 curl http://localhost:8000/health
-curl http://localhost:8000/state | jq
-curl "$CORE_SERVER_URL/health"
 ```
 
-## systemd
+Actual basic health response:
 
-Use `/srv/beam/beam` as the example checkout path below. Adjust paths if you deploy elsewhere.
+```json
+{
+  "status": "healthy",
+  "service": "beam-orchestrator"
+}
+```
+
+Use `/ready` for readiness checks:
+
+```bash
+curl http://localhost:8000/ready | jq
+```
+
+The readiness response includes wallet, subtensor, metagraph, worker availability, background task checks, and `active_workers`.
+
+Other useful endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /state` | Full orchestrator state |
+| `GET /workers/stats` | Connected worker stats |
+| `GET /metrics` | Prometheus metrics |
+| `GET /metrics/json` | JSON metrics |
+
+Logs default to `/tmp/beam_logs/orchestrator.log` unless `LOG_DIR` is set.
+
+## Worker Gateway
+
+The in-process worker gateway accepts:
+
+```text
+ws(s)://<worker-gateway-origin>/ws/<worker_id>?api_key=<worker-api-key>
+```
+
+Workers derive this URL from `WORKER_GATEWAY_URL`. If the orchestrator is reachable directly on `https://orchestrator.example.com`, set:
+
+```dotenv
+ORCHESTRATOR_WORKER_GATEWAY_URL=https://orchestrator.example.com
+```
+
+Then each worker owned by this orchestrator should use:
+
+```dotenv
+WORKER_GATEWAY_URL=https://orchestrator.example.com
+```
+
+The gateway relays:
+
+| Direction | Message types |
+|---|---|
+| BeamCore/orchestrator to worker | `task_offer`, `task_accept_ack`, `task_reject_ack`, `task_result_ack` |
+| Worker to BeamCore/orchestrator | `task_accept`, `task_reject`, `task_result` |
+
+## Task Offer Flow
+
+```text
+BeamCore -> orch-gateway -> orchestrator -> worker gateway -> worker
+worker -> worker gateway -> orchestrator -> orch-gateway -> BeamCore
+worker -> BeamCore HTTP payment-evidence
+```
+
+Each task offer includes executable URLs and headers. The orchestrator chooses a connected worker; BeamCore owns stalled-task recovery and reassignment.
+
+## Troubleshooting
+
+### No tasks are assigned
+
+- Confirm `READY=true`.
+- Confirm the orchestrator WebSocket is connected to `ORCH_GATEWAY_URL`.
+- Confirm the hotkey is registered on subnet 105.
+- Confirm at least one worker is connected to the worker gateway.
+- Check `/ready` for failed readiness checks.
+
+### Worker cannot connect
+
+- Confirm `WORKER_GATEWAY_URL` points to the worker gateway origin, not BeamCore and not `ORCH_GATEWAY_URL`.
+- Confirm the gateway is reachable from the worker host.
+- Confirm the worker registered with BeamCore and has a worker API key.
+
+### BeamCore or orch-gateway connection fails
+
+```bash
+curl https://beamcore.b1m.ai/health
+```
+
+Check network egress, DNS, wallet signing errors, and `ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai`.
+
+## Production Service Example
+
+Use your actual clone path in place of `/srv/beam`:
 
 ```ini
 [Unit]
@@ -82,19 +209,13 @@ After=network.target
 [Service]
 Type=simple
 User=beam
-WorkingDirectory=/srv/beam/beam/neurons/orchestrator
-Environment="PATH=/srv/beam/beam/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-EnvironmentFile=/srv/beam/beam/neurons/orchestrator/.env
-ExecStart=/srv/beam/beam/.venv/bin/python main.py
+WorkingDirectory=/srv/beam/neurons/orchestrator
+Environment="PATH=/srv/beam/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/srv/beam/neurons/orchestrator/.env
+ExecStart=/srv/beam/.venv/bin/python main.py
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-## Troubleshooting
-
-- Verify the hotkey is registered on subnet 105.
-- Verify `CORE_SERVER_URL` and `ORCH_GATEWAY_URL` match the public endpoints above.
-- If no tasks arrive, keep the process running and confirm the node has signaled readiness.

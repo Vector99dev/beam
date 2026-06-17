@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+scripts/
 develop-eggs/
 dist/
 downloads/
@@ -46,30 +47,21 @@ env/
 # Logs
 logs/
 *.log
-*.pid
 
 # Database
 *.db
 *.sqlite3
-
-# Runtime artifacts
-tmp/
-temp/
-.tmp/
-.tmp-*/
-checkpoint_*.json
 
 # OS
 .DS_Store
 Thumbs.db
 
 # Testing
+tests/
 .coverage
 htmlcov/
 .pytest_cache/
 .tox/
-.ruff_cache/
-.cache/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -80,4 +72,6 @@ htmlcov/
 # Bittensor
 wallets/
 ~/.bittensor/
-.bittensor/
+
+#scripts
+scripts/

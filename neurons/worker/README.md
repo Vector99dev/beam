@@ -1,72 +1,82 @@
-# Beam Network Worker
+# Beam Worker
 
-A worker node for the Beam Network — an open coordination layer for distributed data transfer built on Bittensor.
-
-Workers receive data transfer tasks, fetch chunks from a source, deliver them to a destination, and report completion with bandwidth metrics.
+Workers register with BeamCore, connect to an orchestrator-owned worker gateway, execute transfer chunks, report task results, and post payment evidence.
 
 ## Requirements
 
 - Python 3.10+
-- CPU: 2+ cores
-- RAM: 4 GB+
-- Storage: 20 GB SSD
-- Network: 100 Mbps symmetric (upload/download)
-- OS: Ubuntu 22.04+ / Debian 12+ / macOS 13+
+- Bittensor wallet hotkey registered on subnet 105
+- Stable upload/download bandwidth
+- Network access to BeamCore, the worker gateway, and storage URLs in task offers
 
-## Installation
-
-From `beam/` (recommended; matches subnet dependencies):
+## Install
 
 ```bash
+# From the repository root
 pip install -e "."
 ```
 
-The worker runtime also relies on packages declared in [`pyproject.toml`](../../pyproject.toml); for a minimal manual install:
+The runtime dependencies are declared in `pyproject.toml`; for a manual environment, include `bittensor`, `httpx`, and `websockets`.
 
-```bash
-pip install bittensor httpx websockets
+## Mainnet Environment
+
+```dotenv
+CORE_SERVER_URL=https://beamcore.b1m.ai
+WORKER_GATEWAY_URL=https://orchestrator.example.com
+SUBTENSOR_NETWORK=finney
+NETUID=105
+CONNECTION_MODE=websocket
 ```
 
-## Usage
+`WORKER_GATEWAY_URL` must point to the orchestrator-owned worker gateway origin. The worker converts it to `ws(s)://.../ws/<worker_id>?api_key=<worker-api-key>`. Do not point it at BeamCore or `ORCH_GATEWAY_URL`.
 
-Run from `beam/neurons/worker`:
+## Run
 
 ```bash
-# Default wallet
-python worker.py
-
-# Custom wallet
-python worker.py --wallet.name my_wallet --wallet.hotkey my_hotkey
-
-# Mainnet
-python worker.py --subtensor.network finney
+cd neurons/worker
+python worker.py --wallet.name your_coldkey --wallet.hotkey your_hotkey --subtensor.network finney
 ```
 
 ## Transport
 
-The worker uses BeamCore HTTP only for registration and signed bootstrap calls. Transfer runtime uses **worker-gateway** WebSockets (`WORKER_GATEWAY_URL` must be the gateway HTTP/WebSocket origin, not BeamCore Core).
+The worker transport is WebSocket-based. `CONNECTION_MODE` may be `websocket` or `auto`; values such as `polling` are rejected by the runtime.
 
-Typical environment:
+The WebSocket session receives:
 
-```bash
-export CORE_SERVER_URL=https://beamcore.b1m.ai
-export WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
-export CONNECTION_MODE=auto               # or websocket (see worker.py)
-python worker.py --subtensor.network finney
+| Message | Purpose |
+|---|---|
+| `connected` | Worker gateway accepted the session |
+| `task_offer` | Executable transfer chunk offer |
+| `task_accept_ack` | Acceptance acknowledged upstream |
+| `task_reject_ack` | Rejection acknowledged upstream |
+| `task_result_ack` | Result acknowledged and optionally completed |
+
+The worker sends `task_accept`, `task_reject`, and `task_result` messages. Connection liveness is maintained with WebSocket ping/pong and reconnects.
+
+## Payment Evidence
+
+After a successful `task_result_ack`, the worker signs and posts:
+
+```text
+POST /workers/<worker_id>/tasks/<task_id>/payment-evidence
 ```
 
-## How It Works
+Payload:
 
-1. Registers with the network using your Bittensor wallet (signed authentication)
-2. Connects to `worker-gateway` via WebSocket to receive tasks instantly as they are assigned
-3. For each task: fetches data chunks from the source and delivers them to the destination
-4. Reports completion with proof-of-bandwidth metrics (bytes transferred, speed, duration)
-5. Sends periodic heartbeats to stay registered
+```json
+{
+  "offer_id": "uuid",
+  "success": true,
+  "chunk_hash": "abc123...",
+  "worker_signature": "0x...",
+  "required_payment": true
+}
+```
 
-## Environment Variables
+## Troubleshooting
 
-| Variable            | Required | Description |
-| ------------------- | -------- | ----------- |
-| `CORE_SERVER_URL`   | no       | BeamCore HTTP base. |
-| `WORKER_GATEWAY_URL`        | **yes**  | Worker-gateway base URL (`http(s)://host:port` — used to derive WebSocket URLs). |
-| `CONNECTION_MODE`   | no       | `websocket` / `polling` / `auto` (default `websocket` in env). Transfer path expects gateway WebSockets. |
+- Confirm the hotkey is registered on subnet 105.
+- Confirm `CORE_SERVER_URL=https://beamcore.b1m.ai`.
+- Confirm `WORKER_GATEWAY_URL` is reachable from the worker host.
+- Confirm the owning orchestrator has `READY=true` and at least one connected worker.
+- If startup fails with a transport error, remove any polling-mode override.

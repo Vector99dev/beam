@@ -20,7 +20,7 @@ Architecture:
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 
-Transfer execution happens on workers that dial the **worker-gateway** endpoints advertised by BeamCore.
+Transfer execution happens on workers that dial the orchestrator-owned worker gateways advertised to BeamCore.
 Orchestrators still coordinate exclusively through BeamCore APIs rather than talking to arbitrary workers directly.
 """
 
@@ -38,7 +38,7 @@ from core.config import get_settings
 from core.orchestrator import Orchestrator, get_orchestrator
 from middleware.metrics import MetricsMiddleware, get_metrics_collector, get_metrics_response
 from middleware.rate_limiting import RateLimitMiddleware, get_rate_limiter
-from routes import health, orchestrators
+from routes import health, orchestrators, workers
 
 # WebSocket registration, keepalive, and transfer flow are owned by
 # SubnetCoreClient. main.py only wires lifespan + FastAPI routes.
@@ -190,14 +190,14 @@ app = FastAPI(
 BEAM Orchestrator - Decentralized bandwidth mining coordinator.
 
 The Orchestrator connects to BeamCore and:
-- Registers with BeamCore on startup
-- Maintains a live WebSocket control-plane session
-- Receives transfer assignments from BeamCore
-- Manages local worker pools and task distribution
-- Submits proof-of-bandwidth to BeamCore
+- Maintains a live orch-gateway WebSocket control-plane session
+- Advertises an orchestrator-owned worker gateway
+- Receives task offer batches from BeamCore
+- Routes task offers to connected local workers
+- Relays worker decisions and task results upstream
 
-All worker registration, transfer coordination, and validator communication
-is handled centrally by BeamCore.
+Workers register with BeamCore for identity and API keys, then connect to
+the advertised worker gateway for runtime task delivery.
 
 ## Endpoints
 
@@ -231,6 +231,7 @@ if _cors_origins:
 # Mount route modules
 app.include_router(health.router)
 app.include_router(orchestrators.router)
+app.include_router(workers.router)
 
 
 # =============================================================================
@@ -319,7 +320,9 @@ def main():
         import threading
         import webbrowser
 
-        log_viewer_url = os.environ.get("LOG_VIEWER_URL", "https://beamcore.b1m.ai/logs/")
+        log_viewer_url = os.environ.get("LOG_VIEWER_URL")
+        if not log_viewer_url:
+            raise RuntimeError("LOG_VIEWER_URL is required when OPEN_LOG_VIEWER is enabled")
 
         def open_logs():
             time.sleep(1.5)  # Wait for server to start

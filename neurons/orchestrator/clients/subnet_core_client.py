@@ -1,7 +1,7 @@
 """
 BeamCore API Client for Orchestrators
 
-Client for orchestrators to register, list workers, assign chunks, and report
+Client for orchestrators to register, receive task offer batches, and report
 orchestrator state to the BeamCore service.
 
 Uses orch-gateway WebSocket for real-time orchestrator control-plane traffic.
@@ -14,8 +14,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 import websockets
@@ -26,92 +25,13 @@ from middleware.metrics import BEAMCORE_UPSTREAM_DEGRADED, BEAMCORE_UPSTREAM_DOW
 logger = logging.getLogger(__name__)
 
 
-def _coerce_worker_metric(value: Any, default: float) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize_worker_list(workers: list[dict[str, Any]], transfer_id: str) -> list[dict[str, Any]]:
-    normalized_workers: list[dict[str, Any]] = []
-    skipped_workers = 0
-
-    for worker in workers:
-        worker_id = worker.get("worker_id")
-        if not worker_id:
-            skipped_workers += 1
-            continue
-
-        normalized_workers.append(
-            {
-                **worker,
-                "worker_id": worker_id,
-                "trust_score": _coerce_worker_metric(worker.get("trust_score"), 0.5),
-                "bandwidth_mbps": _coerce_worker_metric(worker.get("bandwidth_mbps"), 100.0),
-            }
-        )
-
-    if skipped_workers:
-        logger.warning(
-            "Skipped %s malformed worker entries for transfer %s",
-            skipped_workers,
-            transfer_id,
-        )
-
-    return normalized_workers
-
-
-@dataclass
-class TaskExecutionContext:
-    """Execution context for real data transfer - passed to workers."""
-
-    transfer_id: str
-    stream_id: str
-    gateway_url: str  # REQUIRED - where workers fetch chunks
-    destination_url: str  # REQUIRED - where workers send data
-    chunk_indices: List[int]
-    source_type: str = "http"
-
-
-@dataclass
-class TaskCreate:
-    """Task creation data."""
-
-    task_id: str
-    worker_id: str
-    chunk_size: int
-    chunk_hash: str
-    deadline_us: int
-    source_region: Optional[str] = None
-    dest_region: Optional[str] = None
-    canary_hex: Optional[str] = None
-    canary_offset: Optional[int] = None
-    # Execution context - REQUIRED for real data transfer
-    execution_context: Optional[TaskExecutionContext] = None
-
-
-@dataclass
-class TaskUpdate:
-    """Task update data."""
-
-    status: Optional[str] = None
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
-    bytes_relayed: Optional[int] = None
-    bandwidth_mbps: Optional[float] = None
-    latency_ms: Optional[float] = None
-
-
 class SubnetCoreClient:
     """
     Client for communicating with BeamCore HTTP and orch-gateway WebSocket.
 
     Orchestrators use this client to:
     - Receive real-time notifications via orch-gateway WebSocket
-    - Send orchestrator registration, readiness, worker-list requests, and chunk assignments via orch-gateway WebSocket
+    - Send orchestrator registration and readiness via orch-gateway WebSocket
     - Use BeamCore HTTP for auth bootstrap and read APIs
     - Report task/proof state needed by BeamCore control-plane flows
     """
@@ -156,8 +76,7 @@ class SubnetCoreClient:
         self._ws_ping_timeout = ws_ping_timeout
         self._client: Optional[httpx.AsyncClient] = None
 
-        # WebSocket push handlers (task_result_summary via WS, worker_update via WS)
-        self._task_completion_handler: Optional[Callable] = None
+        # WebSocket push handlers (task offer batches and worker updates via WS)
         self._worker_update_handler: Optional[Callable] = (
             None  # Handler for worker connect/disconnect push events
         )
@@ -185,8 +104,11 @@ class SubnetCoreClient:
         self._api_key_expires: Optional[float] = None
         self._skip_env_key: bool = False
 
-        # Pending worker-list requests keyed by transfer_id (WS protocol)
+        # Pending WebSocket requests keyed by request id
         self._pending_ws_requests: dict[str, asyncio.Future] = {}
+
+        # In-process worker gateway (set after init)
+        self._worker_gateway = None
 
         # orch-gateway → BeamCore upstream relay (independent of orch ↔ orch-gateway edge socket)
         self._beamcore_upstream_degraded: bool = False
@@ -194,15 +116,6 @@ class SubnetCoreClient:
     # =========================================================================
     # Handlers for polling notifications
     # =========================================================================
-
-    def set_task_completion_handler(self, handler: Callable):
-        """
-        Set handler for task completion notifications.
-
-        Handler signature: async def handler(task_completion: dict) -> bool
-        Returns True if task is verified and should be acknowledged.
-        """
-        self._task_completion_handler = handler
 
     def set_worker_update_handler(self, handler: Callable):
         """
@@ -386,7 +299,7 @@ class SubnetCoreClient:
             self._skip_env_key = False
 
             logger.info(f"Obtained API key for orchestrator {self.orchestrator_hotkey[:16]}...")
-            logger.info(f"Save this key as BEAMCORE_API_KEY={self._api_key}")
+            logger.info("Obtained API key is active for this process")
             return self._api_key
 
         except Exception as e:
@@ -397,8 +310,7 @@ class SubnetCoreClient:
         """
         Start WebSocket connection for real-time notifications.
 
-        BeamCore pushes transfers (`transfer_assigned`) and task results
-        (`task_result_summary`) over the orchestrator WebSocket — there is no HTTP
+        BeamCore pushes task offer batches over the orchestrator WebSocket; there is no HTTP
         polling fallback.
         """
         if self._running:
@@ -485,7 +397,7 @@ class SubnetCoreClient:
             max_workers: Maximum workers this orchestrator can handle
             uid: Bittensor UID (optional)
             fee_percentage: Fee percentage charged to workers
-            gateway_url: Public URL of this orchestrator's worker gateway, if externally managed
+            gateway_url: Worker gateway URL advertised to BeamCore
         """
         self._registration_config = {
             "url": url,
@@ -643,10 +555,6 @@ class SubnetCoreClient:
                 data.get("hotkey") or data.get("buffer_id") or "unknown",
             )
 
-        elif msg_type == "task_result_summary":
-            self._note_beamcore_upstream_recovered("task_result_summary from BeamCore")
-            asyncio.create_task(self._handle_task_result(data))
-
         elif msg_type == "upstream_down":
             detail = data.get("message") or "orch-gateway lost BeamCore upstream WebSocket"
             self._note_beamcore_upstream_down(detail)
@@ -654,6 +562,10 @@ class SubnetCoreClient:
         elif msg_type == "upstream_ok":
             detail = data.get("message") or "BeamCore upstream relay connected"
             self._note_beamcore_upstream_recovered(detail)
+
+        elif msg_type == "worker_task_offer_batch":
+            self._note_beamcore_upstream_recovered("worker_task_offer_batch from BeamCore")
+            asyncio.create_task(self._handle_task_offer_batch(data))
 
         elif msg_type == "worker_update":
             # Worker connect/disconnect push event — must not block the recv loop;
@@ -674,16 +586,6 @@ class SubnetCoreClient:
                 asyncio.create_task(
                     _run_worker_update(worker_id, event, self._worker_update_handler)
                 )
-
-        elif msg_type == "transfer_assigned":
-            self._note_beamcore_upstream_recovered("transfer_assigned from BeamCore")
-            asyncio.create_task(self._handle_transfer_assigned(data))
-
-        elif msg_type == "chunks_queued":
-            self._note_beamcore_upstream_recovered("chunks_queued from BeamCore path")
-            logger.info(
-                f"Chunks queued: assignment={data.get('assignment_id')} count={data.get('task_count')}"
-            )
 
         elif msg_type == "register_ack":
             logger.info(f"Registration acknowledged: {data.get('status')}")
@@ -729,23 +631,6 @@ class SubnetCoreClient:
         else:
             logger.debug(f"Unknown WebSocket message type: {msg_type}")
 
-    async def _handle_task_result(self, data: dict[str, Any]) -> None:
-        """Process task results off the receive loop so WS request/reply stays live."""
-        logger.info(f"Received task result: {data.get('task_id')}")
-        if not self._task_completion_handler:
-            return
-
-        try:
-            verified = await self._task_completion_handler(data)
-            if not verified:
-                return
-
-            task_id = data.get("task_id")
-            if task_id:
-                await self.acknowledge_task_completions([task_id])
-        except Exception as e:
-            logger.error(f"Error handling task result: {e}")
-
     async def _send_ws_request(
         self, message: dict[str, Any], timeout: float = 10.0
     ) -> dict[str, Any]:
@@ -772,113 +657,41 @@ class SubnetCoreClient:
 
         return response
 
-    async def _handle_transfer_assigned(self, data: dict) -> None:
-        assignment_id = data.get("assignment_id")
-        transfer_id = data.get("transfer_id")
-        chunk_start = int(data.get("chunk_start", 0))
-        chunk_end = int(data.get("chunk_end", 0))
-        request_id = assignment_id or transfer_id
+    async def _handle_task_offer_batch(self, data: dict) -> None:
+        batch_id = data.get("batch_id")
+        offers = data.get("offers") or []
+        if not isinstance(offers, list) or not offers:
+            logger.warning("worker_task_offer_batch missing offers: batch=%s", batch_id)
+            return
+        if not self._worker_gateway:
+            logger.warning("No local worker gateway available for batch %s", batch_id)
+            return
 
-        logger.info(f"transfer_assigned: transfer={transfer_id} chunks={chunk_start}-{chunk_end}")
-
-        try:
-            if not self._ws:
-                logger.error(f"No WS connection for transfer_assigned {transfer_id}")
-                return
-
-            try:
-                response = await self._send_ws_request(
-                    {
-                        "type": "list_public_workers",
-                        "transfer_id": transfer_id,
-                        "request_id": request_id,
-                    },
-                    timeout=max(30.0, float(self.timeout)),
+        delivered = 0
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+            workers = self._worker_gateway.get_workers_round_robin(1)
+            if not workers:
+                logger.warning("No connected local workers for batch %s", batch_id)
+                break
+            worker_id = workers[0]
+            if await self._worker_gateway.deliver_task_offer(worker_id, offer):
+                delivered += 1
+            else:
+                logger.warning(
+                    "Failed to forward task offer to local worker: batch=%s worker=%s task=%s",
+                    batch_id,
+                    worker_id,
+                    offer.get("task_id"),
                 )
-                workers = response.get("workers", [])
-            except Exception as e:
-                logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
-                return
 
-            normalized_workers = _normalize_worker_list(workers, transfer_id)
-            if not normalized_workers:
-                logger.warning(f"No compatible workers available for assignment {assignment_id}")
-                return
-
-            def worker_score(worker: dict[str, Any]) -> float:
-                trust = worker["trust_score"]
-                bandwidth = worker["bandwidth_mbps"]
-                return trust * min(2.0, bandwidth / 100.0)
-
-            sorted_workers = sorted(normalized_workers, key=worker_score, reverse=True)
-            worker_ids = [worker["worker_id"] for worker in sorted_workers]
-
-            assignments = [
-                {"chunk_index": i, "worker_id": worker_ids[i % len(worker_ids)]}
-                for i in range(chunk_start, chunk_end + 1)
-            ]
-
-            max_attempts = 5
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    response = await self._send_ws_request(
-                        {
-                            "type": "chunk_assignments",
-                            "assignment_id": assignment_id,
-                            "assignments": assignments,
-                        },
-                        timeout=max(30.0, float(self.timeout)),
-                    )
-                    task_count = int(response.get("task_count") or 0)
-                    if response.get("type") != "chunks_queued":
-                        raise RuntimeError(f"unexpected chunk assignment ack: {response}")
-                    if task_count <= 0:
-                        logger.warning(
-                            "Chunk assignment ack reported zero newly queued tasks for "
-                            "assignment %s; tasks may already be active from an earlier submit",
-                            assignment_id,
-                        )
-                    elif task_count < len(assignments):
-                        logger.warning(
-                            "Chunk assignment ack queued fewer tasks than chunks: "
-                            "assignment=%s chunks=%s tasks=%s",
-                            assignment_id,
-                            len(assignments),
-                            task_count,
-                        )
-                    logger.info(
-                        "Queued %s worker tasks from %s chunk_assignments for assignment %s",
-                        task_count,
-                        len(assignments),
-                        assignment_id,
-                    )
-                    return
-                except Exception as e:
-                    if attempt >= max_attempts:
-                        logger.error(
-                            "Failed to queue chunk_assignments for assignment %s after %s attempts: %s",
-                            assignment_id,
-                            max_attempts,
-                            e,
-                        )
-                        return
-                    delay = min(30.0, 2.0 * attempt)
-                    logger.warning(
-                        "Failed to queue chunk_assignments for assignment %s "
-                        "(attempt %s/%s): %s; retrying in %.1fs",
-                        assignment_id,
-                        attempt,
-                        max_attempts,
-                        e,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-        except Exception:
-            logger.exception(
-                "Failed to process transfer_assigned for transfer %s assignment %s",
-                transfer_id,
-                assignment_id,
-            )
+        logger.info(
+            "worker_task_offer_batch delivered locally: batch=%s offers=%s delivered=%s",
+            batch_id,
+            len(offers),
+            delivered,
+        )
 
     def _schedule_ready_sync_if_needed(self) -> None:
         if not self._running or not self._ws_connected:
@@ -946,7 +759,7 @@ class SubnetCoreClient:
             max_workers: Maximum workers this orchestrator can handle
             uid: Bittensor UID (optional)
             fee_percentage: Fee percentage charged to workers
-            gateway_url: Public URL of this orchestrator's worker gateway, if externally managed
+            gateway_url: Worker gateway URL advertised to BeamCore
 
         Returns:
             True if registration message was sent successfully
@@ -995,6 +808,128 @@ class SubnetCoreClient:
             logger.error(f"Failed to send registration via WebSocket: {e}")
             return False
 
+    def set_worker_gateway(self, gateway) -> None:
+        """Wire in the in-process WorkerGateway so task offer batches are dispatched."""
+        self._worker_gateway = gateway
+        gateway.set_upstream(self)
+
+    async def send_task_accept(
+        self,
+        task_id: str,
+        worker_id: str,
+        offer_id: Optional[str],
+        worker_version: Optional[str],
+    ) -> Dict[str, Any]:
+        if not self._ws or not self._ws_connected:
+            logger.warning("send_task_accept: no WS, dropping task=%s", task_id)
+            return {
+                "type": "task_accept_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "orchestrator_ws_disconnected",
+            }
+        msg = {
+            "type": "task_accept",
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "offer_id": offer_id or task_id,
+            "worker_version": worker_version,
+        }
+        try:
+            return await self._send_ws_request(msg)
+        except Exception as exc:
+            logger.warning("send_task_accept send error: %s", exc)
+            return {
+                "type": "task_accept_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "beamcore_accept_forward_failed",
+            }
+
+    async def send_task_reject(
+        self,
+        task_id: str,
+        worker_id: str,
+        offer_id: Optional[str],
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not self._ws or not self._ws_connected:
+            logger.warning("send_task_reject: no WS, dropping task=%s", task_id)
+            return {
+                "type": "task_reject_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "orchestrator_ws_disconnected",
+            }
+        msg = {
+            "type": "task_reject",
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "offer_id": offer_id or task_id,
+        }
+        if reason:
+            msg["reason"] = reason
+        try:
+            return await self._send_ws_request(msg)
+        except Exception as exc:
+            logger.warning("send_task_reject send error: %s", exc)
+            return {
+                "type": "task_reject_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "beamcore_reject_forward_failed",
+            }
+
+    async def send_task_result(self, payload: dict) -> Dict[str, Any]:
+        task_id = payload.get("task_id")
+        offer_id = payload.get("offer_id") or task_id
+        if not self._ws or not self._ws_connected:
+            logger.warning("send_task_result: no WS, dropping")
+            return {
+                "type": "task_result_ack",
+                "task_id": task_id,
+                "offer_id": offer_id,
+                "received": False,
+                "completed": False,
+                "reason": "orchestrator_ws_disconnected",
+            }
+        try:
+            if not task_id or not offer_id:
+                logger.warning("send_task_result: missing task_id/offer_id, dropping")
+                return {
+                    "type": "task_result_ack",
+                    "task_id": task_id,
+                    "offer_id": offer_id,
+                    "received": False,
+                    "completed": False,
+                    "reason": "missing_task_or_offer_id",
+                }
+            message = {
+                "type": "task_result",
+                "task_id": task_id,
+                "offer_id": offer_id,
+                "worker_id": payload.get("worker_id"),
+                "success": bool(payload.get("success")),
+            }
+            for key in ("etag", "chunk_hash", "error"):
+                if payload.get(key) is not None:
+                    message[key] = payload[key]
+            return await self._send_ws_request(message)
+        except Exception as exc:
+            logger.warning("send_task_result send error: %s", exc)
+            return {
+                "type": "task_result_ack",
+                "task_id": task_id,
+                "offer_id": offer_id,
+                "received": False,
+                "completed": False,
+                "reason": "beamcore_result_forward_failed",
+            }
+
     async def update_worker_gateway(
         self, gateway_url: str, max_workers: int = 10000, health: str = "healthy"
     ) -> Dict[str, Any]:
@@ -1029,31 +964,6 @@ class SubnetCoreClient:
                 exc,
             )
             return False
-
-    async def acknowledge_task_completions(
-        self,
-        task_ids: List[str],
-        verified: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Acknowledge task completions to SubnetCore.
-
-        This records task completion state for BeamCore and operator workflows.
-
-        Args:
-            task_ids: List of task IDs to acknowledge
-            verified: Whether the orchestrator verified the completions
-
-        Returns:
-            Acknowledgment result with counts
-        """
-        return await self._send_ws_request(
-            {
-                "type": "acknowledge_tasks",
-                "task_ids": task_ids,
-                "verified": verified,
-            }
-        )
 
     # =========================================================================
     # HTTP Auth & Client
@@ -1129,20 +1039,6 @@ class SubnetCoreClient:
     # =========================================================================
     # Worker Management
     # =========================================================================
-
-    async def list_public_workers(
-        self,
-        status: Optional[str] = None,
-        region: Optional[str] = None,
-        limit: int = 100,
-    ) -> Dict[str, Any]:
-        """List workers on the public worker gateway eligible for this orchestrator."""
-        payload: dict[str, Any] = {"type": "list_public_workers", "limit": limit}
-        if status:
-            payload["status"] = status
-        if region:
-            payload["region"] = region
-        return await self._send_ws_request(payload)
 
     async def get_worker(self, worker_id: str) -> Dict[str, Any]:
         """Get a specific worker.
