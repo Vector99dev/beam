@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beam"
-version = "0.1.0"
+version = "0.2.0"
 description = "Beam - Distributed Bandwidth Subnet on Bittensor"
 readme = "README.md"
 license = {text = "MIT"}
@@ -24,6 +24,7 @@ classifiers = [
 
 dependencies = [
     "bittensor>=10.3.1,<11.0.0",
+    "async-substrate-interface>=2.0.3,<3.0.0",
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
     "sqlalchemy>=2.0.0",

@@ -34,6 +34,7 @@ Usage:
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -61,6 +62,13 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
 try:
+    import redis.asyncio as aioredis
+
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
+try:
     import bittensor as bt
 
     BITTENSOR_AVAILABLE = True
@@ -85,7 +93,27 @@ def resolve_worker_version() -> str:
     try:
         return package_version("beam")
     except PackageNotFoundError:
-        return "0.1.0"
+        return "0.2.0"
+
+
+def parse_strict_semver(value: str) -> Optional[tuple[int, int, int]]:
+    parts = str(value or "").split(".")
+    if len(parts) != 3:
+        return None
+    parsed: list[int] = []
+    for part in parts:
+        if not part.isdigit():
+            return None
+        if len(part) > 1 and part.startswith("0"):
+            return None
+        parsed.append(int(part))
+    return parsed[0], parsed[1], parsed[2]
+
+
+def worker_version_satisfies(minimum_version: str) -> bool:
+    current = parse_strict_semver(WORKER_VERSION)
+    minimum = parse_strict_semver(minimum_version)
+    return bool(current and minimum and current >= minimum)
 
 
 WORKER_VERSION = resolve_worker_version()
@@ -117,6 +145,7 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
 FETCH_STREAM_CHUNK_SIZE = 64 * 1024
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
+WORKER_PIPELINE = os.environ.get("WORKER_PIPELINE", "0") == "1"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -126,8 +155,128 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
-# Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", True)
+# Source-block cache (relay optimization, default OFF). The qualifying load assigns the SAME
+# content block over and over, so re-fetching it from source each task is pure waste. When
+# WORKER_CHUNK_CACHE=1 (+ WORKER_CHUNK_CACHE_REDIS=1) the worker caches each fetched block in Redis
+# keyed by its Content-MD5; on a hit it skips the source GET and uploads the cached bytes. The real
+# dest PUT ALWAYS runs (send_chunk) — only the redundant source download is skipped, never the
+# upload (each task's destination is a unique presigned URL that BeamCore must actually see written
+# to, so it can't be skipped). Every Redis block is md5-verified before serving, so corrupt/wrong
+# data can never be uploaded. The worker degrades to a normal source fetch on ANY Redis error —
+# Redis can NEVER fail a transfer.
+WORKER_CHUNK_CACHE = _env_bool("WORKER_CHUNK_CACHE", False)
+WORKER_CHUNK_CACHE_REDIS = _env_bool("WORKER_CHUNK_CACHE_REDIS", False)
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+WORKER_CHUNK_CACHE_REDIS_TTL = max(0, int(os.environ.get("WORKER_CHUNK_CACHE_REDIS_TTL", "0") or 0))
+REDIS_SOCKET_TIMEOUT = float(os.environ.get("WORKER_CHUNK_CACHE_REDIS_SOCKET_TIMEOUT", "2.0") or 2.0)
+REDIS_CONNECT_TIMEOUT = float(os.environ.get("WORKER_CHUNK_CACHE_REDIS_CONNECT_TIMEOUT", "2.0") or 2.0)
+REDIS_DOWN_COOLDOWN = float(os.environ.get("WORKER_CHUNK_CACHE_REDIS_DOWN_COOLDOWN", "30") or 30)
+_REDIS_KEY_PREFIX = "beam:chunk:"
+_redis_client = None
+_redis_client_lock = asyncio.Lock()
+_redis_down_until = 0.0
+_redis_last_err_log = 0.0
+_chunk_cache_hits = 0
+_chunk_cache_misses = 0
+
+
+def _redis_log_err(msg: str) -> None:
+    """Throttle Redis error logging to once/min so a Redis outage cannot flood the log file."""
+    global _redis_last_err_log
+    now = time.time()
+    if now - _redis_last_err_log > 60:
+        _redis_last_err_log = now
+        print(msg)
+
+
+def _redact_redis_url(url: str) -> str:
+    """Strip any user:pass@ credentials from a Redis URL before logging it."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        netloc = f"{host}:{parts.port}" if parts.port else host
+        if parts.username or parts.password:
+            netloc = "***@" + netloc
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    except Exception:
+        return "redis://<redacted>"
+
+
+def _redis_mark_down(reason: str) -> None:
+    """After a Redis failure, skip the cache for a cooldown so every op doesn't eat a socket timeout."""
+    global _redis_down_until, _redis_client
+    _redis_down_until = time.time() + REDIS_DOWN_COOLDOWN
+    _redis_client = None  # drop the (possibly dead) client; reconnect fresh after the cooldown
+    _redis_log_err(
+        f"[Worker] Redis down ({reason}); skipping cache for {int(REDIS_DOWN_COOLDOWN)}s (source fetch only)"
+    )
+
+
+async def _get_redis():
+    """Async Redis client, or None if the chunk cache is off / unavailable / in a failure cooldown."""
+    global _redis_client
+    if not (WORKER_CHUNK_CACHE and WORKER_CHUNK_CACHE_REDIS and REDIS_AVAILABLE):
+        return None
+    if time.time() < _redis_down_until:  # recently failed -> skip without eating a socket timeout
+        return None
+    if _redis_client is None:
+        async with _redis_client_lock:  # serialize lazy init so concurrent callers don't leak clients
+            if _redis_client is None:
+                try:
+                    _redis_client = aioredis.from_url(
+                        REDIS_URL,
+                        socket_timeout=REDIS_SOCKET_TIMEOUT,
+                        socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
+                    )
+                except Exception as e:
+                    _redis_log_err(f"[Worker] Redis init failed (source fetch only): {exception_detail(e)}")
+                    return None
+    return _redis_client
+
+
+async def _chunk_cache_get(key: str) -> Optional[bytes]:
+    """Return the cached block for a Content-MD5 key from Redis (md5-verified), or None.
+
+    The block is re-verified against the key before use (Redis is persistent/shared, so the bytes
+    could be stale/corrupt). Any Redis error degrades to a miss.
+    """
+    global _chunk_cache_hits, _chunk_cache_misses
+    if not WORKER_CHUNK_CACHE or not key:
+        return None
+    r = await _get_redis()
+    if r is not None:
+        try:
+            blob = await r.get(_REDIS_KEY_PREFIX + key)
+        except Exception as e:
+            blob = None
+            _redis_mark_down(f"get: {exception_detail(e)}")
+        if blob:
+            if base64.b64encode(hashlib.md5(blob).digest()).decode() == key:
+                _chunk_cache_hits += 1
+                return bytes(blob)
+            try:
+                await r.delete(_REDIS_KEY_PREFIX + key)
+            except Exception as de:
+                _redis_log_err(f"[Worker] Redis delete failed for mismatched key {key[:14]}: {exception_detail(de)}")
+            _redis_log_err(f"[Worker] Redis md5 mismatch key={key[:14]} — dropped")
+    _chunk_cache_misses += 1
+    return None
+
+
+async def _chunk_cache_put(key: str, data: bytes) -> None:
+    """Store a verified block in Redis. Redis errors are non-fatal (just no caching)."""
+    if not WORKER_CHUNK_CACHE or not key or not data:
+        return
+    r = await _get_redis()
+    if r is not None:
+        try:
+            if WORKER_CHUNK_CACHE_REDIS_TTL > 0:
+                await r.set(_REDIS_KEY_PREFIX + key, bytes(data), ex=WORKER_CHUNK_CACHE_REDIS_TTL)
+            else:
+                await r.set(_REDIS_KEY_PREFIX + key, bytes(data))
+        except Exception as e:
+            _redis_mark_down(f"set: {exception_detail(e)}")
+
 
 # Global semaphore for task concurrency
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -172,7 +321,7 @@ class TaskExecutionResult:
 
 @dataclass
 class TaskSummaryAck:
-    """BeamCore task_result_ack fields used for payment gating."""
+    """BeamCore task_result_ack fields used by the worker runtime."""
 
     received: bool = False
     completed: bool = False
@@ -330,6 +479,13 @@ def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
 
     source_headers = offer_headers(task.get("source_headers"))
     dest_headers = offer_headers(task.get("dest_headers"))
+    minimum_worker_version = str(task.get("minimum_worker_version") or "").strip()
+    if minimum_worker_version and not worker_version_satisfies(minimum_worker_version):
+        return None, "unsupported_worker_version"
+    signed_url_flow = str(task.get("signed_url_flow") or "").strip()
+    if signed_url_flow == "signed_url_v1" and is_object_storage_presigned_url(dest_url):
+        if not (dest_headers.get("Content-MD5") or dest_headers.get("content-md5")):
+            return None, "missing_content_md5"
     try:
         parsed_range = parse_offer_range(source_headers)
     except ValueError as exc:
@@ -348,6 +504,8 @@ def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
         "range_end": range_end,
         "source_headers": source_headers,
         "dest_headers": dest_headers,
+        "signed_url_flow": signed_url_flow,
+        "minimum_worker_version": minimum_worker_version,
         "transfer_id": str(task.get("transfer_id") or task.get("task_id") or ""),
         "etag_required": bool(task.get("etag_required")),
     }, None
@@ -448,90 +606,6 @@ def sign_message(wallet: Any, message: str) -> str:
     return "0x" + signature.hex()
 
 
-def payment_evidence_message(
-    worker_id: str,
-    task_id: str,
-    offer_id: str,
-    chunk_hash: str = "",
-) -> str:
-    """Canonical message BeamCore verifies for worker payment evidence."""
-    return ":".join(
-        [
-            "beam-worker-payment-evidence",
-            worker_id,
-            task_id,
-            offer_id,
-            chunk_hash or "",
-        ]
-    )
-
-
-async def submit_worker_payment_evidence(
-    state: WorkerState,
-    task_id: str,
-    offer_id: str,
-    chunk_hash: str = "",
-) -> bool:
-    """Submit durable worker-signed payment evidence directly to BeamCore HTTP."""
-    if not state.worker_id or not state.api_key:
-        print("[Worker] Payment evidence skipped: missing worker_id or api_key")
-        return False
-
-    effective_offer = (offer_id or "").strip()
-    if not effective_offer:
-        print(
-            "[Worker] Payment evidence skipped: missing offer_id "
-            f"(task={task_label(task_id)}) — never substitute task_id for attempt UUID"
-        )
-        return False
-
-    message = payment_evidence_message(
-        state.worker_id,
-        task_id,
-        effective_offer,
-        chunk_hash,
-    )
-    try:
-        worker_signature = sign_message(state.wallet, message)
-    except Exception as e:
-        print(f"[Worker] Payment evidence signing failed: {e}")
-        return False
-
-    payload = {
-        "offer_id": effective_offer,
-        "success": True,
-        "chunk_hash": chunk_hash or "",
-        "worker_signature": worker_signature,
-        "required_payment": WORKER_REQUIRED_PAYMENT,
-    }
-    url = f"{state.api_url.rstrip('/')}/workers/{state.worker_id}/tasks/{task_id}/payment-evidence"
-
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(url, json=payload, headers=api_key_headers(state))
-            if 200 <= response.status_code < 300:
-                print(
-                    f"[Worker] Payment evidence OK task={task_label(task_id)} "
-                    f"offer={task_label(effective_offer)}"
-                )
-                return True
-            print(
-                f"[Worker] Payment evidence rejected attempt={attempt + 1}/3 "
-                f"status={response.status_code} task={task_label(task_id)} "
-                f"offer={task_label(effective_offer)}"
-            )
-        except Exception as e:
-            print(f"[Worker] Payment evidence submit error attempt={attempt + 1}/3: {e}")
-        await asyncio.sleep(1 + attempt)
-
-    print(
-        f"[Worker] Payment evidence FAILED after retries task_id={task_id} "
-        f"offer_id={effective_offer} worker_id={state.worker_id}"
-    )
-    return False
-
-
 async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict[str, Any]:
     """Register as a worker with SubnetCore.
 
@@ -541,9 +615,6 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
     hotkey = wallet.hotkey.ss58_address
     ip = await get_public_ip()
     port = 9000
-
-    # Generate a payment pubkey
-    payment_pubkey = hashlib.sha256(f"payment:{hotkey}".encode()).hexdigest()
 
     # Sign the registration message: "{hotkey}:{ip}:{port}"
     message = f"{hotkey}:{ip}:{port}"
@@ -559,7 +630,6 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
         "port": port,
         "claimed_bandwidth_mbps": 100,
         "coldkey": wallet.coldkeypub.ss58_address if wallet.coldkeypub else hotkey,
-        "payment_pubkey": payment_pubkey,
         "signature": signature,
     }
 
@@ -860,6 +930,66 @@ async def send_chunk(
     raise Exception("Max retries exceeded")
 
 
+async def _streamed_object_put(
+    client,
+    source_url,
+    dest_url,
+    chunk_size,
+    source_headers_offer,
+    dest_headers_offer,
+    task_id,
+    offer_id,
+    tee: bool = False,
+):
+    # Overlap source GET with destination PUT (streaming), hashing inline.
+    # Returns (nbytes, sha256_hex, etag, teed_bytes_or_None). Raises on ANY failure -> caller
+    # falls back. tee=True additionally buffers every yielded (already-truncated) part so the
+    # caller can populate the chunk cache without a second source fetch.
+    src_headers = {"ngrok-skip-browser-warning": "true"}
+    if source_headers_offer:
+        src_headers.update(source_headers_offer)
+    hasher = hashlib.sha256()
+    counter = {"n": 0}
+    teed = bytearray() if tee else None
+
+    async def _body():
+        async with client.stream(
+            "GET", source_url, headers=src_headers, timeout=FETCH_TIMEOUT
+        ) as resp:
+            if resp.status_code not in (200, 206):
+                resp.raise_for_status()
+            async for part in resp.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
+                if not part:
+                    continue
+                if counter["n"] + len(part) > chunk_size:
+                    part = part[: chunk_size - counter["n"]]
+                if part:
+                    hasher.update(part)
+                    if teed is not None:
+                        teed.extend(part)
+                    counter["n"] += len(part)
+                    yield part
+                if counter["n"] >= chunk_size:
+                    break
+        if counter["n"] != chunk_size:
+            raise ValueError(
+                f"pipeline source yielded {counter['n']} != expected {chunk_size}"
+            )
+
+    dest_headers = {"Content-Type": "application/octet-stream"}
+    if dest_headers_offer:
+        dest_headers.update(dest_headers_offer)
+    request = client.build_request(
+        "PUT", dest_url, content=_body(), headers=dest_headers, timeout=SEND_TIMEOUT
+    )
+    request.headers["content-length"] = str(chunk_size)
+    request.headers.pop("transfer-encoding", None)
+    response = await client.send(request)
+    response.raise_for_status()
+    etag = response.headers.get("ETag") or response.headers.get("etag")
+    return counter["n"], hasher.hexdigest(), etag, (bytes(teed) if teed is not None else None)
+
+
 async def execute_transfer(
     state: WorkerState,
     task_id: str,
@@ -916,18 +1046,95 @@ async def execute_transfer(
                     last_etag,
                 )
 
+        # Resolve the Content-MD5 source cache up front (the one content id in the offer, available
+        # BEFORE download). HIT -> skip the source GET entirely below and upload the cached bytes.
+        # The destination PUT always still runs (send_chunk) — only the redundant source fetch is
+        # skipped, never the upload.
+        content_md5 = dest_headers_offer.get("Content-MD5") or dest_headers_offer.get("content-md5") or ""
+        cache_key = content_md5 if (WORKER_CHUNK_CACHE and not is_canary) else ""
+        cached_data = await _chunk_cache_get(cache_key) if cache_key else None
+        cache_hit = cached_data is not None and len(cached_data) == chunk_size
+        if cache_key:
+            print(
+                f"[Worker] CACHE {'HIT' if cache_hit else 'MISS'} md5={cache_key[:14]} "
+                f"task={task_label(task_id)} hits={_chunk_cache_hits} misses={_chunk_cache_misses}"
+            )
+
         chunk_started = time.perf_counter()
-        fetch_started = time.perf_counter()
-        data = await fetch_chunk(
-            client,
-            source_url,
-            expected_max_bytes=chunk_size,
-            task_id=task_id,
-            offer_id=offer_id,
-            chunk_index=chunk_index,
-            offer_source_headers=source_headers_offer or None,
-        )
-        fetch_ms = (time.perf_counter() - fetch_started) * 1000
+
+        if cache_hit:
+            data = cached_data
+            fetch_ms = 0.0
+        else:
+            if WORKER_PIPELINE and not is_canary and is_object_storage_presigned_url(destination_url):
+                try:
+                    _pl_t0 = time.perf_counter()
+                    _pl_n, computed_chunk_hash, _pl_etag, _pl_teed = await _streamed_object_put(
+                        client,
+                        source_url,
+                        destination_url,
+                        chunk_size,
+                        source_headers_offer,
+                        dest_headers_offer,
+                        task_id,
+                        offer_id,
+                        tee=bool(cache_key),
+                    )
+                    _pl_expected = chunk_hashes.get(chunk_index) or ""
+                    if (
+                        _pl_expected
+                        and computed_chunk_hash
+                        and _pl_expected.lower() != computed_chunk_hash.lower()
+                    ):
+                        return (
+                            total_bytes,
+                            False,
+                            f"Chunk {chunk_index} hash mismatch (pipeline)",
+                            computed_chunk_hash,
+                            last_etag,
+                        )
+                    if _pl_etag:
+                        last_etag = _pl_etag
+                    total_bytes += _pl_n
+                    # Populate the cache from the teed bytes, only once verified to actually hash
+                    # to the offer's Content-MD5 (defends against a short/bad tee ever landing as
+                    # a false cache entry).
+                    if cache_key and _pl_teed and len(_pl_teed) == chunk_size:
+                        if base64.b64encode(hashlib.md5(_pl_teed).digest()).decode() == content_md5:
+                            await _chunk_cache_put(cache_key, _pl_teed)
+                    _pl_ms = (time.perf_counter() - _pl_t0) * 1000
+                    _pl_mbps = (_pl_n * 8 / 1_000_000) / (_pl_ms / 1000) if _pl_ms > 0 else 0
+                    print(
+                        f"[Worker] Chunk {chunk_index}: {_pl_n} bytes PIPELINED "
+                        f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                        f"stream_ms={_pl_ms:.1f} mbps={_pl_mbps:.1f}"
+                    )
+                    if transfer_context.get("etag_required") and not last_etag:
+                        return (
+                            total_bytes,
+                            False,
+                            "missing ETag from storage PUT response",
+                            computed_chunk_hash or "",
+                            last_etag,
+                        )
+                    print(f"[Worker] Transfer complete: {total_bytes} bytes")
+                    return (total_bytes, True, None, computed_chunk_hash, last_etag)
+                except Exception as _pl_e:
+                    print(
+                        f"[Worker] PIPELINE fallback task={task_label(task_id)} "
+                        f"offer={task_label(offer_id)} err={exception_detail(_pl_e)}"
+                    )
+            fetch_started = time.perf_counter()
+            data = await fetch_chunk(
+                client,
+                source_url,
+                expected_max_bytes=chunk_size,
+                task_id=task_id,
+                offer_id=offer_id,
+                chunk_index=chunk_index,
+                offer_source_headers=source_headers_offer or None,
+            )
+            fetch_ms = (time.perf_counter() - fetch_started) * 1000
 
         bytes_fetched = len(data)
         if bytes_fetched != chunk_size:
@@ -956,6 +1163,13 @@ async def execute_transfer(
                 computed_chunk_hash,
                 last_etag,
             )
+
+        # Populate the cache from a real (non-cached) buffered fetch, once verified against the
+        # offer's Content-MD5. Cache hits never re-store themselves; the pipeline path (above)
+        # stores from its own teed bytes.
+        if cache_key and not cache_hit:
+            if base64.b64encode(hashlib.md5(data).digest()).decode() == content_md5:
+                await _chunk_cache_put(cache_key, data)
 
         if is_canary:
             print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
@@ -1235,7 +1449,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         print("[Worker] [WS] Skipping task: missing task_id")
         return False
     if validation_error or transfer_context is None:
-        reason = f"invalid_offer:{validation_error or 'unknown'}"
+        reason = validation_error if validation_error == "unsupported_worker_version" else f"invalid_offer:{validation_error or 'unknown'}"
         await ws_send_task_reject(websocket, state, task_id, reason, offer_id=offer_id)
         print(
             f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)}: "
@@ -1309,14 +1523,6 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             error=result.error_msg,
             offer_id=offer_id,
         )
-
-        if result.success and summary_ack.completed:
-            await submit_worker_payment_evidence(
-                state,
-                task_id,
-                offer_id,
-                chunk_hash=result.chunk_hash,
-            )
 
         status = "OK" if result.success else f"FAIL: {result.error_msg}"
         print(
@@ -1491,6 +1697,23 @@ async def run_worker(state: WorkerState):
         ),
     )
 
+    if WORKER_CHUNK_CACHE and WORKER_CHUNK_CACHE_REDIS:
+        if not (
+            REDIS_URL.startswith("rediss://")
+            or "127.0.0.1" in REDIS_URL
+            or "localhost" in REDIS_URL
+            or "::1" in REDIS_URL
+        ):
+            print("[Worker] WARNING: REDIS_URL is remote but not rediss:// — chunk cache bytes travel UNENCRYPTED")
+        _r = await _get_redis()
+        if _r is not None:
+            try:
+                await asyncio.wait_for(_r.ping(), timeout=1.5)
+                print(f"[Worker] Redis chunk cache connected: {_redact_redis_url(REDIS_URL)}")
+            except Exception as _e:
+                _redis_mark_down(f"startup ping: {exception_detail(_e)}")
+                print(f"[Worker] Redis unavailable at startup ({exception_detail(_e)}); chunk cache disabled")
+
     try:
         async with httpx.AsyncClient() as client:
             # Register with SubnetCore
@@ -1525,6 +1748,11 @@ async def run_worker(state: WorkerState):
         if state.http_client:
             await state.http_client.aclose()
             state.http_client = None
+        if _redis_client is not None:
+            try:
+                await _redis_client.aclose()
+            except Exception:
+                pass
 
     print("[Worker] Stopped")
 
